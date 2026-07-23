@@ -21,8 +21,7 @@ class Deps:
     repo: Repository | None
     conversation_id: UUID | None
 
-# Keep this many most-recent messages verbatim; summarize anything older.
-HISTORY_KEEP_RECENT = 12
+CONTEXT_WINDOW = 20
 
 async def _summarize_messages(messages: list[ModelMessage]) -> str:
     """Call the model to compress older turns into a short summary."""
@@ -47,10 +46,10 @@ async def _compact_history(messages: list[ModelMessage]) -> list[ModelMessage]:
     """History processor: once history grows past the window, fold the
     older chunk into one summary message and keep only recent turns verbatim.
     """
-    if len(messages) <= HISTORY_KEEP_RECENT:
+    if len(messages) <= CONTEXT_WINDOW:
         return messages
 
-    old, recent = messages[:-HISTORY_KEEP_RECENT], messages[-HISTORY_KEEP_RECENT:]
+    old, recent = messages[:-CONTEXT_WINDOW], messages[-CONTEXT_WINDOW:]
     summary = await _summarize_messages(old)
 
     summary_message = ModelRequest(
@@ -264,7 +263,7 @@ async def get_reply(repo: Repository, conversation_id: UUID, history: list[dict]
     return result.output
 
 
-CONTEXT_WINDOW = 20
+# CONTEXT_WINDOW = 20
 
 async def summarize_title(history: list[dict]) -> str:
     """Summarize the conversation into a short title."""
