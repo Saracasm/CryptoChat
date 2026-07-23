@@ -46,6 +46,10 @@ class Repository:
         conversation.title = title
         await self._session.flush()
 
+    async def delete_conversation(self, conversation: Conversation) -> None:
+        await self._session.delete(conversation)
+        await self._session.flush()
+
     async def _next_seq(self, conversation_id: UUID) -> int:
         stmt = select(func.coalesce(func.max(Message.seq), 0)).where(
             Message.conversation_id == conversation_id

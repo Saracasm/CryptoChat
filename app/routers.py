@@ -2,7 +2,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from app.agent import get_reply, summarize_title
+from app.agent import CONTEXT_WINDOW, get_reply, summarize_title
 from app.dependencies import get_current_profile, get_repository
 from app.models import Profile
 from app.repository import Repository
@@ -42,6 +42,18 @@ async def list_conversations(
     repo: Repository = Depends(get_repository),
 ):
     return await repo.list_conversations(profile.id)
+
+
+@conversations_router.delete("/{conversation_id}", status_code=204)
+async def delete_conversation(
+    conversation_id: UUID,
+    profile: Profile = Depends(get_current_profile),
+    repo: Repository = Depends(get_repository),
+):
+    conversation = await repo.get_conversation(profile.id, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    await repo.delete_conversation(conversation)
 
 
 @conversations_router.get(
@@ -84,10 +96,14 @@ async def send_message(
     # 4. Save the assistant's reply.
     reply = await repo.add_message(conversation_id, "assistant", reply_text)
 
-    # 5. Auto-title on the first exchange.
+    # 5. Auto-title
+    full_messages = llm_messages + [{"role": "assistant", "content": reply_text}]
+    total_messages = len(full_messages)
     if conversation.title is None:
-        summary_input = llm_messages + [{"role": "assistant", "content": reply_text}]
-        title = await summarize_title(summary_input)
+        title = await summarize_title(full_messages)
+        await repo.set_title(conversation, title)
+    elif len(history) < CONTEXT_WINDOW <= total_messages:
+        title = await summarize_title(full_messages[:CONTEXT_WINDOW])
         await repo.set_title(conversation, title)
 
     return reply

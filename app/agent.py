@@ -3,6 +3,7 @@ from uuid import UUID
 
 import httpx
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.providers.openrouter import OpenRouterProvider
@@ -19,6 +20,43 @@ model = OpenRouterModel(
 class Deps:
     repo: Repository | None
     conversation_id: UUID | None
+
+# Keep this many most-recent messages verbatim; summarize anything older.
+HISTORY_KEEP_RECENT = 12
+
+async def _summarize_messages(messages: list[ModelMessage]) -> str:
+    """Call the model to compress older turns into a short summary."""
+    lines = []
+    for m in messages:
+        for part in m.parts:
+            if isinstance(part, (TextPart, UserPromptPart)) and isinstance(part.content, str):
+                role = "user" if isinstance(part, UserPromptPart) else "assistant"
+                lines.append(f"{role}: {part.content}")
+    convo = "\n".join(lines)
+
+    prompt = (
+        "Summarize this portion of a crypto portfolio conversation in a few "
+        "sentences. Preserve any concrete facts the assistant will still need "
+        "(coins mentioned, amounts, prices, corrections/removals made). "
+        "Reply with the summary only.\n\n" + convo
+    )
+    result = await agent.run(prompt, deps=Deps(repo=None, conversation_id=None))
+    return result.output.strip()
+
+async def _compact_history(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """History processor: once history grows past the window, fold the
+    older chunk into one summary message and keep only recent turns verbatim.
+    """
+    if len(messages) <= HISTORY_KEEP_RECENT:
+        return messages
+
+    old, recent = messages[:-HISTORY_KEEP_RECENT], messages[-HISTORY_KEEP_RECENT:]
+    summary = await _summarize_messages(old)
+
+    summary_message = ModelRequest(
+        parts=[UserPromptPart(content=f"[Summary of earlier conversation]: {summary}")]
+    )
+    return [summary_message, *recent]
 
 agent = Agent(
     model,
@@ -37,6 +75,7 @@ agent = Agent(
         "versus what it is worth now, and how today's market move shifted that. "
         "Be clear, concise, and give one practical takeaway."
     ),
+    capabilities=[ProcessHistory(_compact_history)],
 )
 
 @agent.tool
@@ -62,6 +101,26 @@ async def log_holding(
     )
     return f"Logged {amount} {coin} at ${buy_price} each."
 
+async def _resolve_coin_id(coin: str) -> str:
+    """Resolve a coin name/symbol/id (e.g. 'Bitcoin', 'BTC') to its CoinGecko id.
+
+    Tries the literal lowercased value first (it's already an id most of the
+    time), then falls back to CoinGecko's search endpoint for free-text names.
+    """
+    literal = coin.strip().lower()
+    url = "https://api.coingecko.com/api/v3/search"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, params={"query": coin})
+        data = resp.json()
+    coins = data.get("coins", [])
+    if not coins:
+        return literal
+
+    for c in coins:
+        if c["id"] == literal or c["symbol"].lower() == literal or c["name"].lower() == literal:
+            return c["id"]
+    return coins[0]["id"]
+
 @agent.tool
 async def update_holding(ctx: RunContext[Deps], coin:str,
     new_buy_price: float | None = None,
@@ -69,15 +128,16 @@ async def update_holding(ctx: RunContext[Deps], coin:str,
     old_buy_price: float | None = None,) -> str:
     """Correct a previously logged purchase (e.g. the user made a typo).
     Args:
-        coin: CoinGecko coin id, e.g. 'bitcoin'.
+        coin: Coin name, symbol, or CoinGecko id, e.g. 'Bitcoin', 'BTC', 'bitcoin'.
         new_buy_price: The corrected price per unit, if the price was wrong.
         new_amount: The corrected amount, if the amount was wrong.
         old_buy_price: The wrong price to find the holding by (helps pick the
             right lot when there are several).
     """
+    coin_id = await _resolve_coin_id(coin)
     updated = await ctx.deps.repo.update_holding(
         ctx.deps.conversation_id,
-        coin.lower(),
+        coin_id,
         new_amount=new_amount,
         new_buy_price=new_buy_price,
         old_buy_price=old_buy_price,
@@ -91,11 +151,12 @@ async def remove_holding(
     ctx: RunContext[Deps], coin: str, buy_price: float | None = None)-> str:
     """Remove a previously logged purchase.
     Args:
-        coin: CoinGecko coin id, e.g. 'bitcoin'.
+        coin: Coin name, symbol, or CoinGecko id, e.g. 'Bitcoin', 'BTC', 'bitcoin'.
         buy_price: The price of the specific lot to remove (optional).
     """
+    coin_id = await _resolve_coin_id(coin)
     removed = await ctx.deps.repo.remove_holding(
-        ctx.deps.conversation_id, coin.lower(), buy_price=buy_price
+        ctx.deps.conversation_id, coin_id, buy_price=buy_price
     )
     if removed:
         return f"Removed your {coin} holding."
@@ -203,6 +264,8 @@ async def get_reply(repo: Repository, conversation_id: UUID, history: list[dict]
     return result.output
 
 
+CONTEXT_WINDOW = 20
+
 async def summarize_title(history: list[dict]) -> str:
     """Summarize the conversation into a short title."""
     convo = "\n".join(f"{m['role']}: {m['content']}" for m in history)
@@ -212,3 +275,4 @@ async def summarize_title(history: list[dict]) -> str:
     )
     result = await agent.run(prompt, deps=Deps(repo=None, conversation_id=None))
     return result.output.strip()[:80]
+

@@ -1,10 +1,13 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
+import { Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Markdown } from "@/components/markdown";
+import { ThemeToggle } from "@/components/theme-toggle";
 
 type Message = {
   role: string;
@@ -24,6 +27,7 @@ export default function ChatInterface() {
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [sending, setSending] = useState(false);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
   async function loadConversationList(pid: string) {
     const res = await fetch(`/api/conversations`, {
@@ -126,6 +130,26 @@ export default function ChatInterface() {
     if (profileId) startConversation(profileId);
   }
 
+  async function confirmDelete(cid: string) {
+    if (!profileId) return;
+    await fetch(`/api/conversations/${cid}`, {
+      method: "DELETE",
+      headers: { "X-Profile-Id": profileId },
+    });
+    setPendingDeleteId(null);
+
+    const remaining = conversations.filter((c) => c.id !== cid);
+    setConversations(remaining);
+
+    if (cid === conversationId) {
+      if (remaining.length > 0) {
+        await openConversation(remaining[0].id);
+      } else {
+        await startConversation(profileId);
+      }
+    }
+  }
+
   return (
     <div className="flex min-h-screen">
       {/* Sidebar: chat history */}
@@ -134,24 +158,65 @@ export default function ChatInterface() {
           New chat
         </Button>
         <div className="space-y-1">
-          {conversations.map((c) => (
-            <button
-              key={c.id}
-              onClick={() => openConversation(c.id)}
-              className={
-                "w-full truncate rounded-lg px-3 py-2 text-left text-sm " +
-                (c.id === conversationId ? "bg-muted" : "hover:bg-muted")
-              }
-            >
-              {c.title ?? "New chat"}
-            </button>
-          ))}
+          {conversations.map((c) =>
+            pendingDeleteId === c.id ? (
+              <div
+                key={c.id}
+                className="flex items-center justify-between gap-2 rounded-lg bg-muted px-3 py-2 text-sm"
+              >
+                <span className="truncate text-muted-foreground">Delete chat?</span>
+                <div className="flex shrink-0 gap-1">
+                  <Button
+                    variant="destructive"
+                    size="xs"
+                    onClick={() => confirmDelete(c.id)}
+                  >
+                    Delete
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="xs"
+                    onClick={() => setPendingDeleteId(null)}
+                  >
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <div
+                key={c.id}
+                className={
+                  "group flex items-center rounded-lg pr-1 " +
+                  (c.id === conversationId ? "bg-muted" : "hover:bg-muted")
+                }
+              >
+                <button
+                  onClick={() => openConversation(c.id)}
+                  className="min-w-0 flex-1 truncate px-3 py-2 text-left text-sm"
+                >
+                  {c.title ?? "New chat"}
+                </button>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Delete conversation"
+                  className="shrink-0 opacity-0 group-hover:opacity-100"
+                  onClick={() => setPendingDeleteId(c.id)}
+                >
+                  <Trash2 />
+                </Button>
+              </div>
+            )
+          )}
         </div>
       </aside>
 
       {/* Main chat area */}
       <main className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-6 py-12">
-        <h1 className="text-3xl font-semibold">Week 2 Demo - CryptoChat</h1>
+        <div className="flex items-center justify-between">
+          <h1 className="text-3xl font-semibold">Week 2 Demo - CryptoChat</h1>
+          <ThemeToggle />
+        </div>
 
         <Card className="flex-1 space-y-3 p-6">
           {messages.map((message, index) => (
@@ -163,7 +228,11 @@ export default function ChatInterface() {
                   : "max-w-[80%] rounded-2xl bg-muted px-4 py-3"
               }
             >
-              {message.content}
+              {message.role === "user" ? (
+                message.content
+              ) : (
+                <Markdown content={message.content} />
+              )}
             </div>
           ))}
           {sending && (
