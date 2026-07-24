@@ -20,6 +20,48 @@ model = OpenRouterModel(
 class Deps:
     repo: Repository | None
     conversation_id: UUID | None
+    user_id:UUID | None = None    #this is the acting profile's id
+
+from app.database import Base
+
+
+def get_schema_text() -> str:
+    """Introspect the SQLAlchemy schema (Base.metadata) and render it as
+    readable text: tables, columns, types, primary keys, and foreign keys.
+    Used to ground the SQL subagent in the real, current database schema.
+    """
+    lines = []
+    for table in Base.metadata.sorted_tables:
+        lines.append(f"Table: {table.name}")
+        for col in table.columns:
+            col_desc = f"  - {col.name}: {col.type}"
+            if col.primary_key:
+                col_desc += " [PK]"
+            if col.foreign_keys:
+                targets = ", ".join(fk.target_fullname for fk in col.foreign_keys)
+                col_desc += f" [FK -> {targets}]"
+            lines.append(col_desc)
+        lines.append("")
+    return "\n".join(lines)
+
+
+sql_agent = Agent(
+    model,
+    deps_type=Deps,
+    instructions=(
+        "Given a task describing what data is needed, write a single correct "
+        "PostgreSQL query that accomplishes it. Use only the tables and "
+        "columns given to you in the schema -- never invent column or table "
+        "names. Reply with ONLY the SQL query, no explanation, no markdown "
+        "code fences."
+    ),
+)
+
+
+@sql_agent.instructions
+def add_schema_context(ctx: RunContext[Deps]) -> str:
+    """Dynamic instructions: injects the live DB schema on every run."""
+    return f"Here is the current database schema:\n\n{get_schema_text()}"
 
 CONTEXT_WINDOW = 20
 
@@ -182,6 +224,8 @@ async def get_portfolio(ctx: RunContext[Deps]) -> dict:
     and profit/loss -- plus portfolio totals. Use this to explain WHY
     the user is up/down and how much weight their purchases carry.
     """
+    print(f"DEBUG: user_id in state = {ctx.deps.user_id}")
+    print(f"DEBUG: conversation_id in state = {ctx.deps.conversation_id}")
     holdings = await ctx.deps.repo.get_holdings(ctx.deps.conversation_id)
     if not holdings:
         return {"message": "No holdings recorded yet."}
@@ -242,6 +286,21 @@ async def get_portfolio(ctx: RunContext[Deps]) -> dict:
     }
     return report
 
+@agent.tool
+async def write_sql_query(ctx: RunContext[Deps], task: str) -> str:
+    """Delegate to the SQL specialist subagent to write a query for a task.
+
+    Use this when you need to answer something that requires querying the
+    database directly beyond what the other tools provide -- e.g. custom
+    lookups, aggregations, or questions about the raw data.
+
+    Args:
+        task: A plain-English description of what data is needed,
+            e.g. "find all holdings where profit is negative".
+    """
+    result = await sql_agent.run(task, deps=ctx.deps)
+    return result.output
+
 def _to_model_messages(history: list[dict]) -> list[ModelMessage]:
     """Turn our [{'role','content'}] list into Pydantic AI message objects.
     We skip the last one (that's the new prompt, passed separately).
@@ -254,9 +313,11 @@ def _to_model_messages(history: list[dict]) -> list[ModelMessage]:
             messages.append(ModelResponse(parts=[TextPart(content=m["content"])]))
     return messages
 
-async def get_reply(repo: Repository, conversation_id: UUID, history: list[dict])->str:
+async def get_reply(
+    repo: Repository, conversation_id: UUID, history: list[dict], user_id: UUID | None = None
+) -> str:
     """Run the agent with prior context + tools, return the reply text."""
-    deps = Deps(repo=repo, conversation_id=conversation_id)
+    deps = Deps(repo=repo, conversation_id=conversation_id, user_id=user_id)
     latest = history[-1]["content"]
     message_history = _to_model_messages(history)
     result = await agent.run(latest, deps=deps, message_history=message_history)

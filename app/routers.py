@@ -91,8 +91,8 @@ async def send_message(
     llm_messages = [{"role": m.role, "content": m.content} for m in history]
 
     # 3. Run the agent -- it may call tools (log_holding, get_prices, get_portfolio).
-    reply_text = await get_reply(repo, conversation_id, llm_messages)
-
+    reply_text = await get_reply(repo, conversation_id, llm_messages, user_id=profile.id)
+    
     # 4. Save the assistant's reply.
     reply = await repo.add_message(conversation_id, "assistant", reply_text)
 
