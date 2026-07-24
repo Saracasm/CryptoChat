@@ -7,8 +7,10 @@ from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.providers.openrouter import OpenRouterProvider
+from sqlalchemy import text
 
 from app.config import settings
+from app.database import Base
 from app.repository import Repository
 
 model = OpenRouterModel(
@@ -16,12 +18,16 @@ model = OpenRouterModel(
     provider=OpenRouterProvider(api_key=settings.openrouter_api_key),
 )
 
+
 @dataclass
 class Deps:
     repo: Repository | None
     conversation_id: UUID | None
+    user_id: UUID | None = None
+
 
 CONTEXT_WINDOW = 20
+
 
 async def _summarize_messages(messages: list[ModelMessage]) -> str:
     """Call the model to compress older turns into a short summary."""
@@ -42,6 +48,7 @@ async def _summarize_messages(messages: list[ModelMessage]) -> str:
     result = await agent.run(prompt, deps=Deps(repo=None, conversation_id=None))
     return result.output.strip()
 
+
 async def _compact_history(messages: list[ModelMessage]) -> list[ModelMessage]:
     """History processor: once history grows past the window, fold the
     older chunk into one summary message and keep only recent turns verbatim.
@@ -56,6 +63,7 @@ async def _compact_history(messages: list[ModelMessage]) -> list[ModelMessage]:
         parts=[UserPromptPart(content=f"[Summary of earlier conversation]: {summary}")]
     )
     return [summary_message, *recent]
+
 
 agent = Agent(
     model,
@@ -72,14 +80,20 @@ agent = Agent(
         "explain WHY the user is up or down using each coin's 24h change, "
         "and frame the 'weight on their pocket' -- how much they put in (cost basis) "
         "versus what it is worth now, and how today's market move shifted that. "
-        "Be clear, concise, and give one practical takeaway."
+        "Be clear, concise, and give one practical takeaway. "
+        "If the user asks an analytical or reporting question that the other "
+        "tools cannot directly answer (e.g. averages, comparisons, filtering "
+        "by arbitrary conditions), delegate it to ask_sql_agent instead of "
+        "guessing."
     ),
     capabilities=[ProcessHistory(_compact_history)],
 )
 
+
 @agent.tool
 async def log_holding(
-    ctx: RunContext[Deps], coin: str, amount: float, buy_price: float) -> str:
+    ctx: RunContext[Deps], coin: str, amount: float, buy_price: float
+) -> str:
     """Record a crypto purchase (a holding).
 
     Args:
@@ -88,7 +102,6 @@ async def log_holding(
         buy_price: Price paid per unit in USD, e.g. 2400.
     """
     coin_id = coin.lower()
-    # Guard: don't log the same purchase twice (the model may re-read old messages).
     already = await ctx.deps.repo.holding_exists(
         ctx.deps.conversation_id, coin_id, amount, buy_price
     )
@@ -100,12 +113,9 @@ async def log_holding(
     )
     return f"Logged {amount} {coin} at ${buy_price} each."
 
-async def _resolve_coin_id(coin: str) -> str:
-    """Resolve a coin name/symbol/id (e.g. 'Bitcoin', 'BTC') to its CoinGecko id.
 
-    Tries the literal lowercased value first (it's already an id most of the
-    time), then falls back to CoinGecko's search endpoint for free-text names.
-    """
+async def _resolve_coin_id(coin: str) -> str:
+    """Resolve a coin name/symbol/id (e.g. 'Bitcoin', 'BTC') to its CoinGecko id."""
     literal = coin.strip().lower()
     url = "https://api.coingecko.com/api/v3/search"
     async with httpx.AsyncClient() as client:
@@ -120,19 +130,16 @@ async def _resolve_coin_id(coin: str) -> str:
             return c["id"]
     return coins[0]["id"]
 
+
 @agent.tool
-async def update_holding(ctx: RunContext[Deps], coin:str,
+async def update_holding(
+    ctx: RunContext[Deps],
+    coin: str,
     new_buy_price: float | None = None,
     new_amount: float | None = None,
-    old_buy_price: float | None = None,) -> str:
-    """Correct a previously logged purchase (e.g. the user made a typo).
-    Args:
-        coin: Coin name, symbol, or CoinGecko id, e.g. 'Bitcoin', 'BTC', 'bitcoin'.
-        new_buy_price: The corrected price per unit, if the price was wrong.
-        new_amount: The corrected amount, if the amount was wrong.
-        old_buy_price: The wrong price to find the holding by (helps pick the
-            right lot when there are several).
-    """
+    old_buy_price: float | None = None,
+) -> str:
+    """Correct a previously logged purchase (e.g. the user made a typo)."""
     coin_id = await _resolve_coin_id(coin)
     updated = await ctx.deps.repo.update_holding(
         ctx.deps.conversation_id,
@@ -145,14 +152,12 @@ async def update_holding(ctx: RunContext[Deps], coin:str,
         return f"Updated your {coin} holding."
     return f"Couldn't find a {coin} holding to update."
 
+
 @agent.tool
 async def remove_holding(
-    ctx: RunContext[Deps], coin: str, buy_price: float | None = None)-> str:
-    """Remove a previously logged purchase.
-    Args:
-        coin: Coin name, symbol, or CoinGecko id, e.g. 'Bitcoin', 'BTC', 'bitcoin'.
-        buy_price: The price of the specific lot to remove (optional).
-    """
+    ctx: RunContext[Deps], coin: str, buy_price: float | None = None
+) -> str:
+    """Remove a previously logged purchase."""
     coin_id = await _resolve_coin_id(coin)
     removed = await ctx.deps.repo.remove_holding(
         ctx.deps.conversation_id, coin_id, buy_price=buy_price
@@ -161,12 +166,10 @@ async def remove_holding(
         return f"Removed your {coin} holding."
     return f"Couldn't find a {coin} holding to remove."
 
+
 @agent.tool
-async def get_prices(ctx: RunContext[Deps], coins: list[str])->dict:
-    """Get current USD prices for a list of coins from CoinGecko.
-    Args:
-        coins: list of CoinGecko coin ids, e.g. ['bitcoin', 'ethereum'].
-    """
+async def get_prices(ctx: RunContext[Deps], coins: list[str]) -> dict:
+    """Get current USD prices for a list of coins from CoinGecko."""
     ids = ",".join(c.lower() for c in coins)
     url = "https://api.coingecko.com/api/v3/simple/price"
     async with httpx.AsyncClient() as client:
@@ -174,14 +177,10 @@ async def get_prices(ctx: RunContext[Deps], coins: list[str])->dict:
         data = resp.json()
     return {coin: info.get("usd") for coin, info in data.items()}
 
+
 @agent.tool
 async def get_portfolio(ctx: RunContext[Deps]) -> dict:
-    """Compute the portfolio with market context.
-    Returns per-coin: amount held, average buy price, current price,
-    24h market change %, cost basis (what was spent), current value,
-    and profit/loss -- plus portfolio totals. Use this to explain WHY
-    the user is up/down and how much weight their purchases carry.
-    """
+    """Compute the portfolio with market context."""
     holdings = await ctx.deps.repo.get_holdings(ctx.deps.conversation_id)
     if not holdings:
         return {"message": "No holdings recorded yet."}
@@ -192,7 +191,6 @@ async def get_portfolio(ctx: RunContext[Deps]) -> dict:
         p["amount"] += float(h.amount)
         p["cost"] += float(h.amount) * float(h.buy_price)
 
-    # One CoinGecko call gets price + 24h change + rank for every coin.
     ids = ",".join(positions.keys())
     url = "https://api.coingecko.com/api/v3/coins/markets"
     async with httpx.AsyncClient() as client:
@@ -201,7 +199,6 @@ async def get_portfolio(ctx: RunContext[Deps]) -> dict:
         )
         market = resp.json()
 
-    # Index market data by coin id for easy lookup.
     market_by_id = {m["id"]: m for m in market}
 
     report = {}
@@ -221,14 +218,13 @@ async def get_portfolio(ctx: RunContext[Deps]) -> dict:
             "change_24h_percent": (
                 round(change_24h, 2) if change_24h is not None else None
             ),
-            "cost_basis": round(p["cost"], 2),      # what they put in
-            "current_value": round(value, 2),        # what it's worth now
+            "cost_basis": round(p["cost"], 2),
+            "current_value": round(value, 2),
             "profit_loss": round(pnl, 2),
         }
         total_value += value
         total_cost += p["cost"]
 
-    # Add allocation % so the model can talk about "weight" per coin.
     for coin in positions:
         v = report[coin]["current_value"]
         report[coin]["portfolio_weight_percent"] = (
@@ -242,10 +238,95 @@ async def get_portfolio(ctx: RunContext[Deps]) -> dict:
     }
     return report
 
-def _to_model_messages(history: list[dict]) -> list[ModelMessage]:
-    """Turn our [{'role','content'}] list into Pydantic AI message objects.
-    We skip the last one (that's the new prompt, passed separately).
+
+# ---------------------------------------------------------------------
+# SQL subagent: a second Agent whose only job is to answer analytical
+# questions by writing and running read-only SQL against the schema.
+# ---------------------------------------------------------------------
+
+def get_schema_instructions() -> str:
+    """Walk the SQLAlchemy metadata and produce a formatted text
+    description of every table, its columns, and foreign keys. Passed as
+    the SQL subagent's instructions so it always knows the real schema.
     """
+    lines = [
+        "You are a SQL expert working against a Postgres database with the "
+        "following schema. Use these exact table and column names.\n"
+    ]
+    for table in Base.metadata.sorted_tables:
+        lines.append(f"Table: {table.name}")
+        for col in table.columns:
+            col_desc = f"  - {col.name}: {col.type}"
+            if col.primary_key:
+                col_desc += " (PK)"
+            if col.foreign_keys:
+                targets = ", ".join(fk.target_fullname for fk in col.foreign_keys)
+                col_desc += f" (FK -> {targets})"
+            lines.append(col_desc)
+        lines.append("")
+    lines.append(
+        "Rules:\n"
+        "- Only ever write SELECT statements.\n"
+        "- Always filter conversation-scoped tables (messages, holdings) by "
+        "conversation_id.\n"
+        "- Do not invent tables or columns that are not listed above."
+    )
+    return "\n".join(lines)
+
+
+sql_agent = Agent(
+    model,
+    deps_type=Deps,
+    instructions=get_schema_instructions,
+)
+
+
+@sql_agent.tool
+async def run_sql(ctx: RunContext[Deps], query: str) -> list[dict]:
+    """Execute a read-only SQL SELECT query and return the resulting rows.
+
+    Args:
+        query: A single SQL SELECT statement. Must not modify data.
+    """
+    clean_query = query.strip().rstrip(";").strip()
+
+    if ";" in clean_query:
+        return [{"error": "Multiple SQL statements are strictly forbidden."}]
+
+    forbidden = ["insert", "update", "delete", "drop", "alter", "truncate", "create", "grant"]
+    if any(kw in clean_query.lower().split() for kw in forbidden):
+        return [{"error": "Only read-only SELECT queries are allowed."}]
+
+    if not clean_query.lower().startswith("select"):
+        return [{"error": "Only SELECT statements are allowed."}]
+
+    result = await ctx.deps.repo._session.execute(text(clean_query))
+    rows = result.mappings().all()
+    return [dict(row) for row in rows]
+
+
+@agent.tool
+async def ask_sql_agent(ctx: RunContext[Deps], task: str) -> str:
+    """Delegate an analytical or reporting question to the SQL subagent
+    when the other tools cannot directly answer it -- e.g. averages,
+    comparisons across coins, or filtering by conditions not covered by
+    get_portfolio.
+
+    Args:
+        task: A plain-language description of what to find out, e.g.
+            'what is the average buy price across all of my holdings?'
+    """
+    scoped_task = (
+        f"Context: conversation_id='{ctx.deps.conversation_id}', user_id='{ctx.deps.user_id}'.\n"
+        f"User request: {task}\n"
+        f"IMPORTANT: Always scope queries using conversation_id or user_id where applicable."
+    )
+    result = await sql_agent.run(scoped_task, deps=ctx.deps)
+    return result.output
+
+
+def _to_model_messages(history: list[dict]) -> list[ModelMessage]:
+    """Turn our [{'role','content'}] list into Pydantic AI message objects."""
     messages: list[ModelMessage] = []
     for m in history[:-1]:
         if m["role"] == "user":
@@ -254,16 +335,17 @@ def _to_model_messages(history: list[dict]) -> list[ModelMessage]:
             messages.append(ModelResponse(parts=[TextPart(content=m["content"])]))
     return messages
 
-async def get_reply(repo: Repository, conversation_id: UUID, history: list[dict])->str:
+
+async def get_reply(
+    repo: Repository, conversation_id: UUID, history: list[dict], user_id: UUID | None = None
+) -> str:
     """Run the agent with prior context + tools, return the reply text."""
-    deps = Deps(repo=repo, conversation_id=conversation_id)
+    deps = Deps(repo=repo, conversation_id=conversation_id, user_id=user_id)
     latest = history[-1]["content"]
     message_history = _to_model_messages(history)
     result = await agent.run(latest, deps=deps, message_history=message_history)
     return result.output
 
-
-# CONTEXT_WINDOW = 20
 
 async def summarize_title(history: list[dict]) -> str:
     """Summarize the conversation into a short title."""
@@ -274,4 +356,3 @@ async def summarize_title(history: list[dict]) -> str:
     )
     result = await agent.run(prompt, deps=Deps(repo=None, conversation_id=None))
     return result.output.strip()[:80]
-
