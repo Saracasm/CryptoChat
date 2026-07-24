@@ -1,9 +1,9 @@
 from dataclasses import dataclass
 from uuid import UUID
-
 import httpx
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities import ProcessHistory
+from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.providers.openrouter import OpenRouterProvider
@@ -15,6 +15,8 @@ model = OpenRouterModel(
     settings.openrouter_model,
     provider=OpenRouterProvider(api_key=settings.openrouter_api_key),
 )
+
+crypto_mcp_tools = MCPToolset("http://localhost:8001/mcp")
 
 @dataclass
 class Deps:
@@ -63,10 +65,18 @@ def add_schema_context(ctx: RunContext[Deps]) -> str:
     """Dynamic instructions: injects the live DB schema on every run."""
     return f"Here is the current database schema:\n\n{get_schema_text()}"
 
-CONTEXT_WINDOW = 20
+CONTEXT_WINDOW = 6
 
-async def _summarize_messages(messages: list[ModelMessage]) -> str:
-    """Call the model to compress older turns into a short summary."""
+_summary_cache: dict[UUID, tuple[str, int]] = {}
+
+async def _summarize_messages(
+    messages: list[ModelMessage], previous_summary: str | None = None) -> str:
+    """Call the model to compress a chunk of turns into a short summary.
+
+    If previous_summary is given, the model extends it to also cover the
+    new chunk, so only the newly-aged-out messages need to be read instead
+    of re-summarizing the whole growing "old" portion from scratch.
+    """
     lines = []
     for m in messages:
         for part in m.parts:
@@ -75,24 +85,53 @@ async def _summarize_messages(messages: list[ModelMessage]) -> str:
                 lines.append(f"{role}: {part.content}")
     convo = "\n".join(lines)
 
-    prompt = (
-        "Summarize this portion of a crypto portfolio conversation in a few "
-        "sentences. Preserve any concrete facts the assistant will still need "
-        "(coins mentioned, amounts, prices, corrections/removals made). "
-        "Reply with the summary only.\n\n" + convo
-    )
+    if previous_summary:
+        prompt = (
+            "Here is a running summary of a crypto portfolio conversation so far:\n"
+            f"{previous_summary}\n\n"
+            "Extend it to also cover these new turns. Preserve any concrete facts "
+            "the assistant will still need (coins mentioned, amounts, prices, "
+            "corrections/removals made). Reply with the updated summary only, "
+            "a few sentences.\n\n" + convo
+        )
+    else:
+        prompt = (
+            "Summarize this portion of a crypto portfolio conversation in a few "
+            "sentences. Preserve any concrete facts the assistant will still need "
+            "(coins mentioned, amounts, prices, corrections/removals made). "
+            "Reply with the summary only.\n\n" + convo
+        )
     result = await agent.run(prompt, deps=Deps(repo=None, conversation_id=None))
     return result.output.strip()
 
-async def _compact_history(messages: list[ModelMessage]) -> list[ModelMessage]:
+async def _compact_history(
+    ctx: RunContext[Deps], messages: list[ModelMessage]) -> list[ModelMessage]:
     """History processor: once history grows past the window, fold the
-    older chunk into one summary message and keep only recent turns verbatim.
+    older chunk into a running summary and keep only recent turns verbatim.
+
+    The summary is built incrementally, cached per conversation in-process:
+    each call only summarizes messages that newly aged out of the window
+    since the last call, extending the cached summary, rather than
+    re-summarizing the whole "old" chunk from scratch every turn.
     """
     if len(messages) <= CONTEXT_WINDOW:
         return messages
 
     old, recent = messages[:-CONTEXT_WINDOW], messages[-CONTEXT_WINDOW:]
-    summary = await _summarize_messages(old)
+
+    conversation_id = ctx.deps.conversation_id
+    if conversation_id is None:
+        # Sub-run (e.g. the summarizer's own agent.run call) -- there's no
+        # conversation to key a running summary by.
+        summary = await _summarize_messages(old)
+    else:
+        previous_summary, summarized_count = _summary_cache.get(conversation_id, (None, 0))
+        new_chunk = old[summarized_count:]
+        if new_chunk:
+            summary = await _summarize_messages(new_chunk, previous_summary=previous_summary)
+            _summary_cache[conversation_id] = (summary, len(old))
+        else:
+            summary = previous_summary
 
     summary_message = ModelRequest(
         parts=[UserPromptPart(content=f"[Summary of earlier conversation]: {summary}")]
@@ -117,6 +156,7 @@ agent = Agent(
         "Be clear, concise, and give one practical takeaway."
     ),
     capabilities=[ProcessHistory(_compact_history)],
+    toolsets=[crypto_mcp_tools],
 )
 
 @agent.tool
@@ -202,19 +242,6 @@ async def remove_holding(
     if removed:
         return f"Removed your {coin} holding."
     return f"Couldn't find a {coin} holding to remove."
-
-@agent.tool
-async def get_prices(ctx: RunContext[Deps], coins: list[str])->dict:
-    """Get current USD prices for a list of coins from CoinGecko.
-    Args:
-        coins: list of CoinGecko coin ids, e.g. ['bitcoin', 'ethereum'].
-    """
-    ids = ",".join(c.lower() for c in coins)
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url, params={"ids": ids, "vs_currencies": "usd"})
-        data = resp.json()
-    return {coin: info.get("usd") for coin, info in data.items()}
 
 @agent.tool
 async def get_portfolio(ctx: RunContext[Deps]) -> dict:
@@ -323,8 +350,6 @@ async def get_reply(
     result = await agent.run(latest, deps=deps, message_history=message_history)
     return result.output
 
-
-# CONTEXT_WINDOW = 20
 
 async def summarize_title(history: list[dict]) -> str:
     """Summarize the conversation into a short title."""
