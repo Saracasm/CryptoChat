@@ -83,20 +83,15 @@ async def send_message(
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # 1. Save the user's new message.
     await repo.add_message(conversation_id, "user", body.content)
 
-    # 2. Load the full transcript (prior context) and shape it for the agent.
     history = await repo.get_history(conversation_id)
     llm_messages = [{"role": m.role, "content": m.content} for m in history]
 
-    # 3. Run the agent -- it may call tools (log_holding, get_prices, get_portfolio).
-    reply_text = await get_reply(repo, conversation_id, llm_messages)
+    reply_text = await get_reply(repo, conversation_id, llm_messages, profile.id)
 
-    # 4. Save the assistant's reply.
     reply = await repo.add_message(conversation_id, "assistant", reply_text)
 
-    # 5. Auto-title
     full_messages = llm_messages + [{"role": "assistant", "content": reply_text}]
     total_messages = len(full_messages)
     if conversation.title is None:
