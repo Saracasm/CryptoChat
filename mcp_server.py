@@ -1,5 +1,11 @@
+# from uuid import UUID
+
 import httpx
 from mcp.server.fastmcp import FastMCP
+# from sqlalchemy import select
+
+# from app.database import SessionLocal
+# from app.models import Holding
 
 mcp = FastMCP("crypto-tools", host="127.0.0.1", port=8001)
 
@@ -7,19 +13,21 @@ COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
 
 @mcp.tool()
-async def get_prices(coins: list[str]) -> dict:
-    """Get current USD prices for a list of coins.
-
-    Args:
-        coins: CoinGecko coin ids, e.g. ['bitcoin', 'ethereum'].
-    """
-    ids = ",".join(c.lower() for c in coins)
+async def get_trending_coins() -> list[dict]:
+    """Get the coins currently trending (most searched) on CoinGecko."""
     async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{COINGECKO_BASE}/simple/price", params={"ids": ids, "vs_currencies": "usd"}
-        )
+        resp = await client.get(f"{COINGECKO_BASE}/search/trending")
         data = resp.json()
-    return {coin: info.get("usd") for coin, info in data.items()}
+
+    return [
+        {
+            "coin_id": item["item"]["id"],
+            "name": item["item"]["name"],
+            "symbol": item["item"]["symbol"],
+            "market_cap_rank": item["item"].get("market_cap_rank"),
+        }
+        for item in data.get("coins", [])
+    ]
 
 
 async def _resolve_coin_id(coin: str) -> dict:
@@ -43,16 +51,6 @@ async def _resolve_coin_id(coin: str) -> dict:
 
     best = coins[0]
     return {"coin_id": best["id"], "name": best["name"], "matched": True}
-
-
-@mcp.tool()
-async def search_coin(coinsymb: str) -> dict:
-    """Resolve a free-text coin name or symbol to its CoinGecko id.
-
-    Args:
-        coinsymb: Coin name or symbol, e.g. 'Bitcoin', 'BTC', 'Solana'.
-    """
-    return await _resolve_coin_id(coinsymb)
 
 
 @mcp.tool()
@@ -89,22 +87,26 @@ async def get_coin_market_data(coin: str) -> dict:
     }
 
 
-@mcp.tool()
-async def get_trending_coins() -> list[dict]:
-    """Get the coins currently trending (most searched) on CoinGecko."""
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(f"{COINGECKO_BASE}/search/trending")
-        data = resp.json()
+# @mcp.resource("crypto://global-market")
+# async def global_market_snapshot() -> dict:
+#     """Global crypto market reference data: total market cap, 24h volume,
+#     and BTC/ETH dominance. Exposed as a resource (not a tool) because it's
+#     read-only background context an MCP client can pull into its own
+#     context window directly -- no LLM round-trip needed to decide whether
+#     or how to call it, unlike a tool.
+#     """
+#     async with httpx.AsyncClient() as client:
+#         resp = await client.get(f"{COINGECKO_BASE}/global")
+#         data = resp.json().get("data", {})
 
-    return [
-        {
-            "coin_id": item["item"]["id"],
-            "name": item["item"]["name"],
-            "symbol": item["item"]["symbol"],
-            "market_cap_rank": item["item"].get("market_cap_rank"),
-        }
-        for item in data.get("coins", [])
-    ]
+#     return {
+#         "active_cryptocurrencies": data.get("active_cryptocurrencies"),
+#         "total_market_cap_usd": data.get("total_market_cap", {}).get("usd"),
+#         "total_volume_24h_usd": data.get("total_volume", {}).get("usd"),
+#         "market_cap_change_24h_percent": data.get("market_cap_change_percentage_24h_usd"),
+#         "btc_dominance_percent": data.get("market_cap_percentage", {}).get("btc"),
+#         "eth_dominance_percent": data.get("market_cap_percentage", {}).get("eth"),
+#     }
 
 
 if __name__ == "__main__":
