@@ -2,7 +2,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Conversation, Holding, Message, Profile
-
+from sqlalchemy import text
 
 class Repository:
     """All database reads and writes live here, behind simple method calls."""
@@ -161,3 +161,15 @@ class Repository:
         await self._session.delete(holding)
         await self._session.flush()
         return True
+
+    async def execute_raw_sql(self, sql: str) -> list[dict]:
+        """Execute a read-only SQL query and return rows as plain dicts.
+        Only SELECT statements are allowed -- this exists to let the SQL
+        subagent answer questions, not to let it mutate data.
+        """
+        cleaned = sql.strip().rstrip(";")
+        if not cleaned.lower().startswith("select"):
+            raise ValueError("Only SELECT queries are permitted here.")
+        result = await self._session.execute(text(cleaned))
+        rows = result.mappings().all()
+        return [dict(row) for row in rows]

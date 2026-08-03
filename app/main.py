@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.routers import conversations_router, profiles_router
 
-app = FastAPI(title="Week 2 Chat Demo")
+app = FastAPI(title="Chat Demo")
 
 # Allow the Next.js frontend (localhost:3000) to call this API from the browser.
 app.add_middleware(

@@ -16,7 +16,9 @@ model = OpenRouterModel(
     provider=OpenRouterProvider(api_key=settings.openrouter_api_key),
 )
 
+
 crypto_mcp_tools = MCPToolset("http://localhost:8001/mcp")
+
 
 @dataclass
 class Deps:
@@ -59,15 +61,31 @@ sql_agent = Agent(
     ),
 )
 
-
 @sql_agent.instructions
 def add_schema_context(ctx: RunContext[Deps]) -> str:
-    """Dynamic instructions: injects the live DB schema on every run."""
-    return f"Here is the current database schema:\n\n{get_schema_text()}"
+    """Dynamic instructions: injects the live DB schema and the current
+    conversation_id, so the agent scopes queries correctly."""
+    return (
+        f"Here is the current database schema:\n\n{get_schema_text()}\n\n"
+        f"IMPORTANT: The current conversation_id is '{ctx.deps.conversation_id}'. "
+        "Any query touching the holdings table MUST filter by "
+        f"conversation_id = '{ctx.deps.conversation_id}'. Never return rows "
+        "from other conversations. Only write SELECT queries -- never "
+        "INSERT, UPDATE, DELETE, or DDL statements."
+    )
 
 CONTEXT_WINDOW = 6
 
 _summary_cache: dict[UUID, tuple[str, int]] = {}
+
+summarizer_agent = Agent(
+    model,
+    deps_type=Deps,
+    instructions=(
+        "You summarize conversations. Never call any tools. "
+        "Just read the conversation and produce a summary."
+    ),
+)
 
 async def _summarize_messages(
     messages: list[ModelMessage], previous_summary: str | None = None) -> str:
@@ -101,7 +119,8 @@ async def _summarize_messages(
             "(coins mentioned, amounts, prices, corrections/removals made). "
             "Reply with the summary only.\n\n" + convo
         )
-    result = await agent.run(prompt, deps=Deps(repo=None, conversation_id=None))
+    # result = await agent.run(prompt, deps=Deps(repo=None, conversation_id=None))
+    result = await summarizer_agent.run(prompt, deps=Deps(repo=None, conversation_id=None))
     return result.output.strip()
 
 async def _compact_history(
@@ -153,7 +172,12 @@ agent = Agent(
         "explain WHY the user is up or down using each coin's 24h change, "
         "and frame the 'weight on their pocket' -- how much they put in (cost basis) "
         "versus what it is worth now, and how today's market move shifted that. "
-        "Be clear, concise, and give one practical takeaway."
+        "Be clear, concise, and give one practical takeaway. "
+        "If the user explicitly asks to see, write, or be given a SQL query, "
+        "call write_sql_query and show them the SQL text in your reply. "
+        "If they're asking a normal question about their data (e.g. 'what is my "
+        "biggest purchase'), call write_sql_query but answer using the result "
+        "data only -- do not show the SQL unless asked."
     ),
     capabilities=[ProcessHistory(_compact_history)],
     toolsets=[crypto_mcp_tools],
@@ -315,18 +339,30 @@ async def get_portfolio(ctx: RunContext[Deps]) -> dict:
 
 @agent.tool
 async def write_sql_query(ctx: RunContext[Deps], task: str) -> str:
-    """Delegate to the SQL specialist subagent to write a query for a task.
+    """Delegate to the SQL specialist to write AND run a query, returning
+    both the SQL used and the resulting data.
 
     Use this when you need to answer something that requires querying the
     database directly beyond what the other tools provide -- e.g. custom
-    lookups, aggregations, or questions about the raw data.
+    lookups, aggregations, or questions about the raw data. Also use this
+    when the user explicitly asks to see or be given a SQL query.
 
     Args:
         task: A plain-English description of what data is needed,
-            e.g. "find all holdings where profit is negative".
+            e.g. "find the holding with the largest loss".
     """
     result = await sql_agent.run(task, deps=ctx.deps)
-    return result.output
+    sql_query = result.output.strip().strip("`")
+
+    try:
+        rows = await ctx.deps.repo.execute_raw_sql(sql_query)
+    except Exception as e:
+        return f"Query used:\n{sql_query}\n\nThe query failed to run: {e}"
+
+    if not rows:
+        return f"Query used:\n{sql_query}\n\nResult: the query ran successfully but returned no rows."
+    return f"Query used:\n{sql_query}\n\nResult: {rows}"
+
 
 def _to_model_messages(history: list[dict]) -> list[ModelMessage]:
     """Turn our [{'role','content'}] list into Pydantic AI message objects.
@@ -358,6 +394,7 @@ async def summarize_title(history: list[dict]) -> str:
         "Summarize this conversation into a short title of at most 6 words. "
         "Reply with the title only.\n\n" + convo
     )
-    result = await agent.run(prompt, deps=Deps(repo=None, conversation_id=None))
+    #result = await agent.run(prompt, deps=Deps(repo=None, conversation_id=None))
+    result = await summarizer_agent.run(prompt, deps=Deps(repo=None, conversation_id=None))
     return result.output.strip()[:80]
 
