@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -28,6 +28,31 @@ export default function ChatInterface() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [sending, setSending] = useState(false);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const [sidebarWidth, setSidebarWidth] = useState(256);
+  const isResizing = useRef(false);
+
+  const startResizing = useCallback(() => {
+    isResizing.current = true;
+  }, []);
+
+  const stopResizing = useCallback(() => {
+    isResizing.current = false;
+  }, []);
+
+  const resize = useCallback((event: MouseEvent) => {
+    if (!isResizing.current) return;
+    const next = Math.min(Math.max(event.clientX, 180), 480);
+    setSidebarWidth(next);
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener("mousemove", resize);
+    window.addEventListener("mouseup", stopResizing);
+    return () => {
+      window.removeEventListener("mousemove", resize);
+      window.removeEventListener("mouseup", stopResizing);
+    };
+  }, [resize, stopResizing]);
 
   async function loadConversationList(pid: string) {
     const res = await fetch(`/api/conversations`, {
@@ -151,9 +176,12 @@ export default function ChatInterface() {
   }
 
   return (
-    <div className="flex min-h-screen">
+    <div className="flex h-screen overflow-hidden">
       {/* Sidebar: chat history */}
-      <aside className="w-64 shrink-0 border-r p-4 space-y-3">
+      <aside
+        style={{ width: sidebarWidth }}
+        className="flex shrink-0 flex-col border-r p-4 space-y-3 overflow-y-auto"
+      >
         <Button className="w-full" onClick={handleNewChat}>
           New chat
         </Button>
@@ -211,14 +239,18 @@ export default function ChatInterface() {
         </div>
       </aside>
 
-      {/* Main chat area */}
-      <main className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-6 py-12">
-        <div className="flex items-center justify-between">
+      <div
+        onMouseDown={startResizing}
+        className="w-1 shrink-0 cursor-col-resize bg-transparent hover:bg-border active:bg-border"
+      />
+
+      <main className="mx-auto flex h-full w-full max-w-3xl flex-col gap-6 overflow-hidden px-6 py-12">
+        <div className="flex shrink-0 items-center justify-between">
           <h1 className="text-3xl font-semibold">Week 2 Demo - CryptoChat</h1>
           <ThemeToggle />
         </div>
 
-        <Card className="flex-1 space-y-3 p-6">
+        <Card className="flex-1 space-y-3 overflow-y-auto p-6">
           {messages.map((message, index) => (
             <div
               key={index}
@@ -242,7 +274,7 @@ export default function ChatInterface() {
           )}
         </Card>
 
-        <form className="flex gap-3" onSubmit={handleSubmit}>
+        <form className="flex shrink-0 gap-3" onSubmit={handleSubmit}>
           <Input
             value={draft}
             onChange={(event) => setDraft(event.target.value)}

@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from uuid import UUID
 import httpx
@@ -7,9 +8,10 @@ from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.providers.openrouter import OpenRouterProvider
-
 from app.config import settings
 from app.repository import Repository
+
+logger = logging.getLogger(__name__)
 
 model = OpenRouterModel(
     settings.openrouter_model,
@@ -74,9 +76,10 @@ def add_schema_context(ctx: RunContext[Deps]) -> str:
         "INSERT, UPDATE, DELETE, or DDL statements."
     )
 
+
 CONTEXT_WINDOW = 6
 
-_summary_cache: dict[UUID, tuple[str, int]] = {}
+summary_cache: dict[UUID, tuple[str, int]] = {}
 
 summarizer_agent = Agent(
     model,
@@ -134,6 +137,10 @@ async def _compact_history(
     re-summarizing the whole "old" chunk from scratch every turn.
     """
     if len(messages) <= CONTEXT_WINDOW:
+        logger.info(
+            "compact_history: skipped (%d messages <= window %d)",
+            len(messages), CONTEXT_WINDOW,
+        )
         return messages
 
     old, recent = messages[:-CONTEXT_WINDOW], messages[-CONTEXT_WINDOW:]
@@ -142,14 +149,25 @@ async def _compact_history(
     if conversation_id is None:
         # Sub-run (e.g. the summarizer's own agent.run call) -- there's no
         # conversation to key a running summary by.
+        logger.info("compact_history: summarizing %d messages (no conversation_id)", len(old))
         summary = await _summarize_messages(old)
     else:
-        previous_summary, summarized_count = _summary_cache.get(conversation_id, (None, 0))
+        previous_summary, summarized_count = summary_cache.get(conversation_id, (None, 0))
         new_chunk = old[summarized_count:]
         if new_chunk:
+            logger.info(
+                "compact_history: conversation %s - extending summary with %d new message(s) "
+                "(previously summarized %d)",
+                conversation_id, len(new_chunk), summarized_count,
+            )
             summary = await _summarize_messages(new_chunk, previous_summary=previous_summary)
-            _summary_cache[conversation_id] = (summary, len(old))
+            summary_cache[conversation_id] = (summary, len(old))
+            logger.info("compact_history: conversation %s - summary updated", conversation_id)
         else:
+            logger.info(
+                "compact_history: conversation %s - reusing cached summary, no new messages",
+                conversation_id,
+            )
             summary = previous_summary
 
     summary_message = ModelRequest(
@@ -177,7 +195,9 @@ agent = Agent(
         "call write_sql_query and show them the SQL text in your reply. "
         "If they're asking a normal question about their data (e.g. 'what is my "
         "biggest purchase'), call write_sql_query but answer using the result "
-        "data only -- do not show the SQL unless asked."
+        "data only -- do not show the SQL unless asked. "
+        "Always finish your turn by either calling exactly one tool or writing a "
+        "plain text reply -- never return an empty response with no tool call and no text."
     ),
     capabilities=[ProcessHistory(_compact_history)],
     toolsets=[crypto_mcp_tools],
