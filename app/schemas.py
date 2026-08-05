@@ -42,3 +42,19 @@ class VisualizationCreate(BaseModel):
 
 class PortfolioChartCreate(BaseModel):
     chart_type: Literal["allocation", "profit_loss", "cost_vs_value"] = "allocation"
+
+
+class DocumentUploadResult(BaseModel):
+    document_id: UUID
+    filename: str
+    chunk_count: int
+    char_count: int
+
+
+class DocumentRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    filename: str
+    content_type: str
+    created_at: datetime

@@ -1,14 +1,17 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile
 import httpx
 
 from app.agent import CONTEXT_WINDOW, get_portfolio_report, get_reply, summarize_title
 from app.dependencies import get_current_profile, get_repository
+from app.ingest import ingest_document
 from app.models import Profile
 from app.repository import Repository
 from app.schemas import (
     ConversationRead,
+    DocumentRead,
+    DocumentUploadResult,
     MessageCreate,
     MessageRead,
     PortfolioChartCreate,
@@ -172,3 +175,37 @@ async def create_visualization(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail="Market data provider is unavailable") from exc
+
+
+documents_router = APIRouter(prefix="/documents", tags=["documents"])
+
+
+@documents_router.post("/upload", response_model=DocumentUploadResult)
+async def upload_document(
+    file: UploadFile,
+    profile: Profile = Depends(get_current_profile),
+    repo: Repository = Depends(get_repository),
+):
+    """Ingest one file into the acting profile's private RAG corpus:
+    extract text (MarkItDown) -> chunk (Chonkie) -> embed (Gemini) -> store.
+    """
+    file_bytes = await file.read()
+    try:
+        summary = await ingest_document(
+            repo,
+            profile.id,
+            file.filename or "upload",
+            file.content_type or "application/octet-stream",
+            file_bytes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return summary
+
+
+@documents_router.get("", response_model=list[DocumentRead])
+async def list_documents(
+    profile: Profile = Depends(get_current_profile),
+    repo: Repository = Depends(get_repository),
+):
+    return await repo.list_documents(profile.id)

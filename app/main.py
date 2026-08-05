@@ -1,7 +1,7 @@
 import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import conversations_router, profiles_router
+from app.routers import conversations_router, documents_router, profiles_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,6 +19,7 @@ app.add_middleware(
 )
 app.include_router(profiles_router)
 app.include_router(conversations_router)
+app.include_router(documents_router)
 
 @app.get("/")
 async def root():

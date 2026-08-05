@@ -18,6 +18,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from app.config import settings
+from app.embeddings import embed_query
 from app.visualization import build_portfolio_visualization, resolve_coin_id
 from app.repository import Repository
 
@@ -216,6 +217,13 @@ agent = Agent(
         "If they're asking a normal question about their data (e.g. 'what is my "
         "biggest purchase'), call write_sql_query but answer using the result "
         "data only -- do not show the SQL unless asked. "
+        "Relevant excerpts from the user's uploaded documents may already appear "
+        "in context as '[Relevant excerpts from your uploaded documents]' -- use "
+        "them when they help answer the question, and name the source filename "
+        "when you rely on one. If you need a different or more specific search "
+        "of their documents than what's already provided, call "
+        "search_uploaded_documents. Never invent facts that aren't in the "
+        "retrieved excerpts or your other tools' output. "
         "Use only the tool calls needed to answer accurately, then finish with a "
         "plain text reply -- never return an empty response with no tool call and no text."
     ),
@@ -487,6 +495,36 @@ async def create_portfolio_chart(
 
 
 @agent.tool
+async def search_uploaded_documents(
+    ctx: RunContext[Deps], query: str, top_k: int = 5
+) -> dict:
+    """Search the user's own uploaded documents for relevant passages.
+
+    Use this for a targeted look beyond whatever excerpts are already in
+    context -- e.g. the user asks about a specific detail in a document they
+    uploaded (a whitepaper, a statement, their notes).
+
+    Args:
+        query: What to search for, in the document's own terms.
+        top_k: Max chunks to return (1-10). Defaults to 5.
+    """
+    if ctx.deps.user_id is None:
+        return {"error": "No active profile to search documents for."}
+    top_k = max(1, min(top_k, 10))
+    try:
+        query_vector = await embed_query(query)
+        results = await ctx.deps.repo.search_document_chunks(
+            ctx.deps.user_id, query_vector, top_k=top_k
+        )
+    except Exception as exc:
+        logger.warning("search_uploaded_documents failed: %s", exc)
+        return {"error": "Document search is temporarily unavailable."}
+    if not results:
+        return {"message": "No uploaded documents matched this query."}
+    return {"results": results}
+
+
+@agent.tool
 async def write_sql_query(ctx: RunContext[Deps], task: str) -> str:
     """Delegate to the SQL specialist to write AND run a query, returning
     both the SQL used and the resulting data.
@@ -511,6 +549,46 @@ async def write_sql_query(ctx: RunContext[Deps], task: str) -> str:
     if not rows:
         return f"Query used:\n{sql_query}\n\nResult: the query ran successfully but returned no rows."
     return f"Query used:\n{sql_query}\n\nResult: {rows}"
+
+
+# Cap on how much retrieved document text gets injected per turn (roughly
+# 1500 tokens at ~4 chars/token) so RAG context can't crowd out the rest of
+# the conversation window.
+DOCUMENT_CONTEXT_CHAR_BUDGET = 6000
+DOCUMENT_CONTEXT_TOP_K = 5
+
+
+async def _build_document_context(
+    repo: Repository, user_id: UUID | None, query: str
+) -> str | None:
+    """Auto-retrieve the top-k most relevant chunks from the user's own
+    uploaded documents for this message, token-budgeted. Never raises --
+    on any embedding/DB failure this degrades to "no context" rather than
+    breaking the chat turn.
+    """
+    if repo is None or user_id is None or not query.strip():
+        return None
+    try:
+        query_vector = await embed_query(query)
+        chunks = await repo.search_document_chunks(
+            user_id, query_vector, top_k=DOCUMENT_CONTEXT_TOP_K
+        )
+    except Exception as exc:
+        logger.warning("Auto document retrieval failed: %s", exc)
+        return None
+    if not chunks:
+        return None
+
+    pieces = []
+    remaining = DOCUMENT_CONTEXT_CHAR_BUDGET
+    for chunk in chunks:
+        if remaining <= 0:
+            break
+        text = chunk["chunk_text"][:remaining]
+        remaining -= len(text)
+        pieces.append(f"[{chunk['filename']} - chunk {chunk['chunk_index']}]\n{text}")
+
+    return "[Relevant excerpts from your uploaded documents]\n\n" + "\n\n---\n\n".join(pieces)
 
 
 def _to_model_messages(history: list[dict]) -> list[ModelMessage]:
@@ -550,6 +628,13 @@ async def get_reply(
     deps = Deps(repo=repo, conversation_id=conversation_id, user_id=user_id)
     latest = history[-1]["content"]
     message_history = _to_model_messages(history)
+
+    document_context = await _build_document_context(repo, user_id, latest)
+    if document_context:
+        message_history.append(
+            ModelRequest(parts=[UserPromptPart(content=document_context)])
+        )
+
     result = await agent.run(latest, deps=deps, message_history=message_history)
     reply = result.output
     if _used_risk_tool(result.new_messages()) and "not financial advice" not in reply.lower():

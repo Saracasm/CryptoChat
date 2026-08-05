@@ -1,8 +1,8 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
-import { BarChart3, ChevronLeft, ChevronRight, MessageSquare, Plus, Send, Trash2, Upload } from "lucide-react";
+import { BarChart3, ChevronLeft, ChevronRight, FileText, MessageSquare, Plus, Send, Trash2, Upload } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -76,6 +76,15 @@ type PinnedChart = {
   };
 };
 
+type UploadedDocument = {
+  id: string;
+  filename: string;
+  content_type: string;
+  created_at: string;
+};
+
+const ALLOWED_UPLOAD_EXTENSIONS = ".pdf,.docx,.md,.markdown,.txt,.csv";
+
 const PORTFOLIO_CHART_OPTIONS: { type: PortfolioChartType; label: string }[] = [
   { type: "allocation", label: "Allocation donut" },
   { type: "profit_loss", label: "P&L by coin" },
@@ -113,7 +122,14 @@ export default function ChatInterface() {
   const [portfolioChartLoading, setPortfolioChartLoading] = useState(false);
   const [portfolioChartError, setPortfolioChartError] = useState<string | null>(null);
   const [pinnedCharts, setPinnedCharts] = useState<PinnedChart[]>([]);
+  const [documents, setDocuments] = useState<UploadedDocument[]>([]);
+  const [documentsLoading, setDocumentsLoading] = useState(false);
+  const [documentsError, setDocumentsError] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const resizingPanel = useRef<"sidebar" | "dashboard" | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const startResizing = useCallback(() => {
     resizingPanel.current = "sidebar";
@@ -232,6 +248,58 @@ export default function ChatInterface() {
 
   function unpinChart(id: string) {
     setPinnedCharts((current) => current.filter((c) => c.id !== id));
+  }
+
+  const loadDocuments = useCallback(async () => {
+    if (!profileId) return;
+    setDocumentsLoading(true);
+    setDocumentsError(null);
+    try {
+      const response = await fetch(`/api/documents`, {
+        headers: { "X-Profile-Id": profileId },
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail ?? "Unable to load documents.");
+      setDocuments(data);
+    } catch (error) {
+      setDocuments([]);
+      setDocumentsError(error instanceof Error ? error.message : "Unable to load documents.");
+    } finally {
+      setDocumentsLoading(false);
+    }
+  }, [profileId]);
+
+  useEffect(() => {
+    if (!dashboardCollapsed) loadDocuments();
+  }, [dashboardCollapsed, loadDocuments]);
+
+  async function handleFileSelected(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = ""; // reset so re-selecting the same file re-triggers onChange
+    if (!file || !profileId) return;
+
+    setUploading(true);
+    setUploadError(null);
+    setUploadStatus(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const response = await fetch(`/api/documents`, {
+        method: "POST",
+        headers: { "X-Profile-Id": profileId },
+        body: formData,
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail ?? "Upload failed.");
+      setUploadStatus(
+        `${data.filename} indexed — ${data.chunk_count} chunk${data.chunk_count === 1 ? "" : "s"} ready to search.`
+      );
+      await loadDocuments();
+    } catch (error) {
+      setUploadError(error instanceof Error ? error.message : "Upload failed.");
+    } finally {
+      setUploading(false);
+    }
   }
 
   async function loadConversationList(pid: string) {
@@ -495,7 +563,21 @@ export default function ChatInterface() {
         </Card>
 
         <form className="flex shrink-0 gap-3" onSubmit={handleSubmit}>
-          <Button type="button" variant="outline" size="icon" aria-label="Upload a file" disabled>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept={ALLOWED_UPLOAD_EXTENSIONS}
+            onChange={handleFileSelected}
+            className="hidden"
+          />
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            aria-label="Upload a file"
+            disabled={uploading || !profileId}
+            onClick={() => fileInputRef.current?.click()}
+          >
             <Upload />
           </Button>
           <Input
@@ -508,6 +590,17 @@ export default function ChatInterface() {
             <Send />
           </Button>
         </form>
+        {(uploading || uploadError || uploadStatus) && (
+          <p
+            className={
+              uploadError
+                ? "shrink-0 text-xs text-destructive"
+                : "shrink-0 text-xs text-muted-foreground"
+            }
+          >
+            {uploading ? "Uploading…" : uploadError ?? uploadStatus}
+          </p>
+        )}
       </main>
 
       {/* Dashboard: chart and portfolio data will be connected next. */}
@@ -597,6 +690,61 @@ export default function ChatInterface() {
                 <Button variant="outline" className="mt-4 w-full" disabled>
                   Make your own graph
                 </Button>
+              </section>
+
+              <section className="border-b p-5">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <FileText className="size-5 text-primary" />
+                    <h2 className="text-lg font-semibold">Documents</h2>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={uploading || !profileId}
+                    onClick={() => fileInputRef.current?.click()}
+                  >
+                    {uploading ? "Uploading…" : "Upload"}
+                  </Button>
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  PDF, DOCX, Markdown, TXT, or CSV — indexed for the assistant to search in chat.
+                </p>
+
+                {uploadError && (
+                  <p className="mt-2 text-xs text-destructive">{uploadError}</p>
+                )}
+                {uploadStatus && !uploadError && (
+                  <p className="mt-2 text-xs text-emerald-600">{uploadStatus}</p>
+                )}
+
+                <div className="mt-3 max-h-40 space-y-2 overflow-y-auto">
+                  {documentsLoading && (
+                    <p className="text-sm text-muted-foreground">Loading documents…</p>
+                  )}
+                  {documentsError && (
+                    <p className="text-sm text-destructive">{documentsError}</p>
+                  )}
+                  {!documentsLoading && !documentsError && documents.length === 0 && (
+                    <div className="rounded-lg border border-dashed p-3 text-center text-xs text-muted-foreground">
+                      No documents uploaded yet.
+                    </div>
+                  )}
+                  {documents.map((doc) => (
+                    <div
+                      key={doc.id}
+                      className="flex items-center gap-2 rounded-lg border px-3 py-2"
+                    >
+                      <FileText className="size-4 shrink-0 text-muted-foreground" />
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-medium">{doc.filename}</p>
+                        <p className="truncate text-xs text-muted-foreground">
+                          {new Date(doc.created_at).toLocaleDateString()}
+                        </p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </section>
 
               <section className="min-h-0 flex-1 p-5">

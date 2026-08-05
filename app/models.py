@@ -1,10 +1,10 @@
 from datetime import datetime
 from uuid import UUID
-
-from sqlalchemy import ForeignKey, Numeric, String, Text, func
-from sqlalchemy.dialects.postgresql import TIMESTAMP, UUID as PG_UUID
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
+from app.config import settings
 from app.database import Base
 
 
@@ -20,6 +20,9 @@ class Profile(Base):
     )
 
     conversations: Mapped[list["Conversation"]] = relationship(
+        back_populates="profile", cascade="all, delete-orphan"
+    )
+    documents: Mapped[list["Document"]] = relationship(
         back_populates="profile", cascade="all, delete-orphan"
     )
 
@@ -89,3 +92,49 @@ class Holding(Base):
     )
 
     conversation: Mapped["Conversation"] = relationship(back_populates="holdings")
+
+
+class Document(Base):
+    """One uploaded, RAG-ingestible file. Owned by a profile, never shared
+    across profiles -- retrieval always filters on profile_id."""
+
+    __tablename__ = "documents"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    profile_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("profiles.id", name="uploaded"), nullable=False
+    )
+    filename: Mapped[str] = mapped_column(String)
+    content_type: Mapped[str] = mapped_column(String)
+    raw_text: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    profile: Mapped["Profile"] = relationship(back_populates="documents")
+    chunks: Mapped[list["DocumentEmbedding"]] = relationship(
+        back_populates="document", cascade="all, delete-orphan"
+    )
+
+
+class DocumentEmbedding(Base):
+    """One token-chunk of a Document plus its embedding vector."""
+
+    __tablename__ = "document_embeddings"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    document_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("documents.id", name="chunks"),
+        nullable=False,
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer)
+    chunk_text: Mapped[str] = mapped_column(Text)
+    embedding: Mapped[list[float]] = mapped_column(Vector(settings.embedding_dimensions))
+    chunk_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+
+    document: Mapped["Document"] = relationship(back_populates="chunks")
