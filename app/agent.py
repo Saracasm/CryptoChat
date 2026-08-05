@@ -185,6 +185,13 @@ agent = Agent(
         "amount), call update_holding to fix the existing entry -- do NOT log a "
         "new one. If they want to remove a purchase, call remove_holding. "
         "When they ask how their portfolio is doing, call get_portfolio. "
+        "You also have market-intelligence MCP tools. Use get_historical_prices "
+        "for price trends, get_market_overview to explain broad market moves, "
+        "get_crypto_news for recent headlines, and get_upcoming_events for "
+        "project updates. For a risk question, first call get_portfolio, then "
+        "call get_portfolio_risk with a list of its per-coin values in the form "
+        "{'coin': coin_id, 'current_value': value}. Treat news and project "
+        "updates as context, not proof of price causation. "
         "Use CoinGecko coin ids like 'bitcoin', 'ethereum', 'solana'. "
         "When you report the portfolio, INTERPRET the data, do not just list numbers: "
         "explain WHY the user is up or down using each coin's 24h change, "
@@ -196,7 +203,7 @@ agent = Agent(
         "If they're asking a normal question about their data (e.g. 'what is my "
         "biggest purchase'), call write_sql_query but answer using the result "
         "data only -- do not show the SQL unless asked. "
-        "Always finish your turn by either calling exactly one tool or writing a "
+        "Use only the tool calls needed to answer accurately, then finish with a "
         "plain text reply -- never return an empty response with no tool call and no text."
     ),
     capabilities=[ProcessHistory(_compact_history)],
