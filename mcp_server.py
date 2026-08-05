@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from app.visualization import COINGECKO_BASE, get_json, get_market_chart, resolve_coin_id
 # from sqlalchemy import select
 
 # from app.database import SessionLocal
@@ -11,24 +12,13 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("crypto-tools", host="127.0.0.1", port=8001)
 
-COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 CRYPTOCOMPARE_NEWS_URL = "https://min-api.cryptocompare.com/data/v2/news/"
-
-
-async def _get_json(url: str, *, params: dict | None = None) -> dict:
-    """Fetch JSON from a public market-data endpoint with useful failures."""
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        response = await client.get(url, params=params)
-        response.raise_for_status()
-        return response.json()
 
 
 @mcp.tool()
 async def get_trending_coins() -> list[dict]:
     """Get the coins currently trending (most searched) on CoinGecko."""
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(f"{COINGECKO_BASE}/search/trending")
-        data = resp.json()
+    data = await get_json(f"{COINGECKO_BASE}/search/trending")
 
     return [
         {
@@ -41,29 +31,6 @@ async def get_trending_coins() -> list[dict]:
     ]
 
 
-async def _resolve_coin_id(coin: str) -> dict:
-    """Resolve free-text coin input (name, symbol, or id) to a CoinGecko id.
-
-    Tries the literal lowercased value first (it's already an id most of the
-    time), then falls back to CoinGecko's search endpoint for free-text names.
-    """
-    literal = coin.strip().lower()
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(f"{COINGECKO_BASE}/search", params={"query": coin})
-        data = resp.json()
-
-    coins = data.get("coins", [])
-    if not coins:
-        return {"coin_id": literal, "name": coin, "matched": False}
-
-    for c in coins:
-        if literal in (c["id"], c["symbol"].lower(), c["name"].lower()):
-            return {"coin_id": c["id"], "name": c["name"], "matched": True}
-
-    best = coins[0]
-    return {"coin_id": best["id"], "name": best["name"], "matched": True}
-
-
 @mcp.tool()
 async def get_coin_market_data(coin: str) -> dict:
     """Get market cap, 24h change, rank, and volume for a coin.
@@ -71,15 +38,13 @@ async def get_coin_market_data(coin: str) -> dict:
     Args:
         coin: Coin name, symbol, or CoinGecko id, e.g. 'Bitcoin', 'BTC', 'bitcoin'.
     """
-    resolved = await _resolve_coin_id(coin)
+    resolved = await resolve_coin_id(coin)
     coin_id = resolved["coin_id"]
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{COINGECKO_BASE}/coins/markets",
-            params={"vs_currency": "usd", "ids": coin_id},
-        )
-        data = resp.json()
+    data = await get_json(
+        f"{COINGECKO_BASE}/coins/markets",
+        params={"vs_currency": "usd", "ids": coin_id},
+    )
 
     if not data:
         return {"error": f"No market data found for '{coin}'."}
@@ -114,12 +79,10 @@ async def get_historical_prices(
     if interval not in {"daily", "hourly"}:
         return {"error": "interval must be 'daily' or 'hourly'."}
 
-    resolved = await _resolve_coin_id(coin)
     try:
-        data = await _get_json(
-            f"{COINGECKO_BASE}/coins/{resolved['coin_id']}/market_chart",
-            params={"vs_currency": "usd", "days": days, "interval": interval},
-        )
+        result = await get_market_chart(coin, days, interval)
+        resolved = result["coin"]
+        data = result["data"]
     except httpx.HTTPError as exc:
         return {"error": f"Could not fetch historical prices for '{coin}': {exc}"}
 
@@ -149,7 +112,7 @@ async def get_market_overview() -> dict:
     Use this to explain whether a portfolio move reflects a broad market move.
     """
     try:
-        data = (await _get_json(f"{COINGECKO_BASE}/global")).get("data", {})
+        data = (await get_json(f"{COINGECKO_BASE}/global")).get("data", {})
     except httpx.HTTPError as exc:
         return {"error": f"Could not fetch global market data: {exc}"}
 
@@ -179,7 +142,7 @@ async def get_crypto_news(coin: str | None = None, limit: int = 5) -> dict:
     if coin:
         params["categories"] = coin.upper()
     try:
-        data = await _get_json(CRYPTOCOMPARE_NEWS_URL, params=params)
+        data = await get_json(CRYPTOCOMPARE_NEWS_URL, params=params)
     except httpx.HTTPError as exc:
         return {"error": f"Could not fetch crypto news: {exc}"}
 
@@ -210,9 +173,9 @@ async def get_upcoming_events(coin: str, limit: int = 10) -> dict:
     """
     if not 1 <= limit <= 20:
         return {"error": "limit must be between 1 and 20."}
-    resolved = await _resolve_coin_id(coin)
+    resolved = await resolve_coin_id(coin)
     try:
-        data = await _get_json(
+        data = await get_json(
             f"{COINGECKO_BASE}/coins/{resolved['coin_id']}/status_updates",
             params={"per_page": limit, "page": 1},
         )

@@ -1,8 +1,9 @@
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
+import httpx
 
-from app.agent import CONTEXT_WINDOW, get_reply, summarize_title
+from app.agent import CONTEXT_WINDOW, get_portfolio_report, get_reply, summarize_title
 from app.dependencies import get_current_profile, get_repository
 from app.models import Profile
 from app.repository import Repository
@@ -10,8 +11,16 @@ from app.schemas import (
     ConversationRead,
     MessageCreate,
     MessageRead,
+    PortfolioChartCreate,
     ProfileCreate,
     ProfileRead,
+    VisualizationCreate,
+)
+from app.visualization import (
+    PortfolioVisualizationResult,
+    VisualizationResult,
+    build_market_visualization,
+    build_portfolio_visualization,
 )
 
 profiles_router = APIRouter(prefix="/profiles", tags=["profiles"])
@@ -70,6 +79,19 @@ async def load_messages(
     return await repo.get_history(conversation_id)
 
 
+@conversations_router.get("/{conversation_id}/portfolio")
+async def get_conversation_portfolio(
+    conversation_id: UUID,
+    profile: Profile = Depends(get_current_profile),
+    repo: Repository = Depends(get_repository),
+):
+    """Return the authenticated conversation's live portfolio report."""
+    conversation = await repo.get_conversation(profile.id, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return await get_portfolio_report(repo, conversation_id)
+
+
 @conversations_router.post(
     "/{conversation_id}/messages", response_model=MessageRead
 )
@@ -107,3 +129,46 @@ async def send_message(
         await repo.set_title(conversation, title)
 
     return reply
+
+
+@conversations_router.post(
+    "/{conversation_id}/portfolio-chart", response_model=PortfolioVisualizationResult
+)
+async def create_portfolio_chart_endpoint(
+    conversation_id: UUID,
+    body: PortfolioChartCreate,
+    profile: Profile = Depends(get_current_profile),
+    repo: Repository = Depends(get_repository),
+):
+    """Create a private chart (allocation / P&L / cost-vs-value) from the
+    authenticated conversation's own portfolio. Reuses get_portfolio_report --
+    the same math the chat agent uses -- so figures never drift apart."""
+    conversation = await repo.get_conversation(profile.id, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    portfolio = await get_portfolio_report(repo, conversation_id)
+    if "message" in portfolio:
+        raise HTTPException(status_code=422, detail=portfolio["message"])
+    try:
+        return build_portfolio_visualization(portfolio, body.chart_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@conversations_router.post("/{conversation_id}/visualizations", response_model=VisualizationResult)
+async def create_visualization(
+    conversation_id: UUID,
+    body: VisualizationCreate,
+    profile: Profile = Depends(get_current_profile),
+    repo: Repository = Depends(get_repository),
+):
+    """Create chart data, Plotly JSON, and editable Python code for the UI."""
+    conversation = await repo.get_conversation(profile.id, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    try:
+        return await build_market_visualization(body.coin, body.metric, body.days)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Market data provider is unavailable") from exc

@@ -1,13 +1,16 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { Trash2 } from "lucide-react";
+import dynamic from "next/dynamic";
+import { BarChart3, ChevronLeft, ChevronRight, MessageSquare, Plus, Send, Trash2, Upload } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Markdown } from "@/components/markdown";
 import { ThemeToggle } from "@/components/theme-toggle";
+
+const Plot = dynamic(() => import("react-plotly.js"), { ssr: false });
 
 type Message = {
   role: string;
@@ -20,6 +23,71 @@ type Conversation = {
   created_at: string;
 };
 
+type ChartMetric = "price_usd" | "daily_change_pct" | "market_cap_usd" | "volume_usd";
+
+type MarketChart = {
+  title: string;
+  chart: {
+    data: object[];
+    layout: object;
+  };
+};
+
+type Holding = {
+  amount: number;
+  current_value: number | null;
+  profit_loss: number | null;
+  portfolio_weight_percent: number | null;
+  change_24h_percent: number | null;
+};
+
+type PortfolioTotal = {
+  cost_basis: number;
+  current_value: number | null;
+  profit_loss: number | null;
+  today_move_usd: number | null;
+  today_move_percent: number | null;
+};
+type PortfolioMeta = { prices_unavailable: boolean; message: string };
+type Portfolio = {
+  _total?: PortfolioTotal;
+  _meta?: PortfolioMeta;
+  message?: string;
+  [coin: string]: Holding | PortfolioTotal | PortfolioMeta | string | undefined;
+};
+
+type PortfolioChartType = "allocation" | "profit_loss" | "cost_vs_value";
+
+type PortfolioChart = {
+  chart_type: PortfolioChartType;
+  title: string;
+  chart: {
+    data: object[];
+    layout: object;
+  };
+};
+
+type PinnedChart = {
+  id: string;
+  title: string;
+  chart: {
+    data: object[];
+    layout: object;
+  };
+};
+
+const PORTFOLIO_CHART_OPTIONS: { type: PortfolioChartType; label: string }[] = [
+  { type: "allocation", label: "Allocation donut" },
+  { type: "profit_loss", label: "P&L by coin" },
+  { type: "cost_vs_value", label: "Cost vs. value" },
+];
+
+const currency = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  maximumFractionDigits: 2,
+});
+
 export default function ChatInterface() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
@@ -29,20 +97,43 @@ export default function ChatInterface() {
   const [sending, setSending] = useState(false);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(256);
-  const isResizing = useRef(false);
+  const [dashboardWidth, setDashboardWidth] = useState(350);
+  const [dashboardCollapsed, setDashboardCollapsed] = useState(false);
+  const [selectedCoin, setSelectedCoin] = useState("bitcoin");
+  const [selectedMetric, setSelectedMetric] = useState<ChartMetric>("daily_change_pct");
+  const [selectedDays, setSelectedDays] = useState(30);
+  const [marketChart, setMarketChart] = useState<MarketChart | null>(null);
+  const [chartLoading, setChartLoading] = useState(false);
+  const [chartError, setChartError] = useState<string | null>(null);
+  const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
+  const [portfolioLoading, setPortfolioLoading] = useState(false);
+  const [portfolioError, setPortfolioError] = useState<string | null>(null);
+  const [portfolioChartType, setPortfolioChartType] = useState<PortfolioChartType>("allocation");
+  const [portfolioChart, setPortfolioChart] = useState<PortfolioChart | null>(null);
+  const [portfolioChartLoading, setPortfolioChartLoading] = useState(false);
+  const [portfolioChartError, setPortfolioChartError] = useState<string | null>(null);
+  const [pinnedCharts, setPinnedCharts] = useState<PinnedChart[]>([]);
+  const resizingPanel = useRef<"sidebar" | "dashboard" | null>(null);
 
   const startResizing = useCallback(() => {
-    isResizing.current = true;
+    resizingPanel.current = "sidebar";
   }, []);
 
+  const startDashboardResizing = useCallback(() => {
+    if (!dashboardCollapsed) resizingPanel.current = "dashboard";
+  }, [dashboardCollapsed]);
+
   const stopResizing = useCallback(() => {
-    isResizing.current = false;
+    resizingPanel.current = null;
   }, []);
 
   const resize = useCallback((event: MouseEvent) => {
-    if (!isResizing.current) return;
-    const next = Math.min(Math.max(event.clientX, 180), 480);
-    setSidebarWidth(next);
+    if (resizingPanel.current === "sidebar") {
+      setSidebarWidth(Math.min(Math.max(event.clientX, 180), 480));
+    }
+    if (resizingPanel.current === "dashboard") {
+      setDashboardWidth(Math.min(Math.max(window.innerWidth - event.clientX, 300), 560));
+    }
   }, []);
 
   useEffect(() => {
@@ -53,6 +144,95 @@ export default function ChatInterface() {
       window.removeEventListener("mouseup", stopResizing);
     };
   }, [resize, stopResizing]);
+
+  const loadMarketChart = useCallback(async () => {
+    if (!profileId || !conversationId) return;
+    setChartLoading(true);
+    setChartError(null);
+    try {
+      const response = await fetch(`/api/conversations/${conversationId}/visualizations`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Profile-Id": profileId },
+        body: JSON.stringify({
+          coin: selectedCoin,
+          metric: selectedMetric,
+          days: selectedDays,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail ?? "Unable to load market data.");
+      setMarketChart(data);
+    } catch (error) {
+      setMarketChart(null);
+      setChartError(error instanceof Error ? error.message : "Unable to load market data.");
+    } finally {
+      setChartLoading(false);
+    }
+  }, [conversationId, profileId, selectedCoin, selectedDays, selectedMetric]);
+
+  useEffect(() => {
+    if (!dashboardCollapsed) loadMarketChart();
+  }, [dashboardCollapsed, loadMarketChart]);
+
+  const loadPortfolio = useCallback(async () => {
+    if (!profileId || !conversationId) return;
+    setPortfolioLoading(true);
+    setPortfolioError(null);
+    try {
+      const response = await fetch(`/api/conversations/${conversationId}/portfolio`, {
+        headers: { "X-Profile-Id": profileId },
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail ?? "Unable to load portfolio.");
+      setPortfolio(data);
+    } catch (error) {
+      setPortfolio(null);
+      setPortfolioError(error instanceof Error ? error.message : "Unable to load portfolio.");
+    } finally {
+      setPortfolioLoading(false);
+    }
+  }, [conversationId, profileId]);
+
+  useEffect(() => {
+    if (!dashboardCollapsed) loadPortfolio();
+  }, [dashboardCollapsed, loadPortfolio]);
+
+  const loadPortfolioChart = useCallback(async () => {
+    if (!profileId || !conversationId) return;
+    setPortfolioChartLoading(true);
+    setPortfolioChartError(null);
+    try {
+      const response = await fetch(`/api/conversations/${conversationId}/portfolio-chart`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Profile-Id": profileId },
+        body: JSON.stringify({ chart_type: portfolioChartType }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail ?? "Unable to build portfolio chart.");
+      setPortfolioChart(data);
+    } catch (error) {
+      setPortfolioChart(null);
+      setPortfolioChartError(error instanceof Error ? error.message : "Unable to build portfolio chart.");
+    } finally {
+      setPortfolioChartLoading(false);
+    }
+  }, [conversationId, portfolioChartType, profileId]);
+
+  useEffect(() => {
+    if (!dashboardCollapsed) loadPortfolioChart();
+  }, [dashboardCollapsed, loadPortfolioChart]);
+
+  function pinPortfolioChart() {
+    if (!portfolioChart) return;
+    setPinnedCharts((current) => [
+      ...current,
+      { id: `${Date.now()}`, title: portfolioChart.title, chart: portfolioChart.chart },
+    ]);
+  }
+
+  function unpinChart(id: string) {
+    setPinnedCharts((current) => current.filter((c) => c.id !== id));
+  }
 
   async function loadConversationList(pid: string) {
     const res = await fetch(`/api/conversations`, {
@@ -149,6 +329,7 @@ export default function ChatInterface() {
     ]);
     setSending(false);
     await loadConversationList(profileId);
+    await loadPortfolio();
   }
 
   function handleNewChat() {
@@ -175,17 +356,34 @@ export default function ChatInterface() {
     }
   }
 
+  const portfolioTotal = portfolio?._total as PortfolioTotal | undefined;
+  const pricesUnavailable = portfolio?._meta?.prices_unavailable ?? false;
+  const portfolioHoldings = Object.entries(portfolio ?? {})
+    .filter(([coin, value]) => coin !== "_total" && coin !== "_meta" && typeof value === "object" && value !== null && "amount" in value)
+    .map(([coin, value]) => ({ coin, ...(value as Holding) }));
+  const portfolioChangePercent = portfolioTotal?.cost_basis && portfolioTotal.profit_loss !== null
+    ? (portfolioTotal.profit_loss / portfolioTotal.cost_basis) * 100
+    : 0;
+
   return (
-    <div className="flex h-screen overflow-hidden">
+    <div className="flex h-screen overflow-hidden bg-background">
       {/* Sidebar: chat history */}
       <aside
         style={{ width: sidebarWidth }}
-        className="flex shrink-0 flex-col border-r p-4 space-y-3 overflow-y-auto"
+        className="flex shrink-0 flex-col border-r bg-sidebar p-4 text-sidebar-foreground space-y-5 overflow-y-auto"
       >
+        <div className="flex items-center gap-2 px-1 text-sm font-semibold">
+          <span className="size-2 rounded-full bg-primary" />
+          Portfolio Assistant
+        </div>
         <Button className="w-full" onClick={handleNewChat}>
+          <Plus />
           New chat
         </Button>
-        <div className="space-y-1">
+        <div className="space-y-2">
+          <p className="px-1 text-xs font-medium tracking-wider text-muted-foreground">
+            CONVERSATIONS
+          </p>
           {conversations.map((c) =>
             pendingDeleteId === c.id ? (
               <div
@@ -244,48 +442,327 @@ export default function ChatInterface() {
         className="w-1 shrink-0 cursor-col-resize bg-transparent hover:bg-border active:bg-border"
       />
 
-      <main className="mx-auto flex h-full w-full max-w-3xl flex-col gap-6 overflow-hidden px-6 py-12">
+      <main className="flex min-w-0 flex-1 flex-col gap-5 overflow-hidden px-6 py-7 xl:px-8">
         <div className="flex shrink-0 items-center justify-between">
-          <h1 className="text-3xl font-semibold">Week 2 Demo - CryptoChat</h1>
+          <div>
+            <h1 className="text-xl font-semibold">AI chat</h1>
+            <p className="text-sm text-muted-foreground">
+              Ask about your portfolio or the market
+            </p>
+          </div>
           <ThemeToggle />
         </div>
 
-        <Card className="flex-1 space-y-3 overflow-y-auto p-6">
-          {messages.map((message, index) => (
-            <div
-              key={index}
-              className={
-                message.role === "user"
-                  ? "ml-auto max-w-[80%] rounded-2xl bg-primary px-4 py-3 text-primary-foreground"
-                  : "max-w-[80%] rounded-2xl bg-muted px-4 py-3"
-              }
-            >
-              {message.role === "user" ? (
-                message.content
-              ) : (
-                <Markdown content={message.content} />
-              )}
+        <Card className="flex-1 overflow-y-auto p-6">
+          {messages.length === 0 ? (
+            <div className="flex h-full flex-col items-center justify-center text-center">
+              <div className="mb-4 grid size-14 place-items-center rounded-full bg-primary/10 text-primary">
+                <MessageSquare className="size-6" />
+              </div>
+              <h2 className="text-2xl font-semibold">Ask anything about your portfolio</h2>
+              <p className="mt-2 max-w-md text-sm text-muted-foreground">
+                Get analysis, compare assets, upload a statement, or log a purchase.
+              </p>
+              <div className="mt-6 flex flex-wrap justify-center gap-2">
+                {["Explain today’s BTC move", "Rebalance suggestions", "Compare ETH vs SOL"].map((prompt) => (
+                  <Button key={prompt} variant="outline" size="sm" onClick={() => setDraft(prompt)}>
+                    {prompt}
+                  </Button>
+                ))}
+              </div>
             </div>
-          ))}
-          {sending && (
-            <div className="max-w-[80%] rounded-2xl bg-muted px-4 py-3 text-muted-foreground">
-              Thinking...
+          ) : (
+            <div className="space-y-3">
+              {messages.map((message, index) => (
+                <div
+                  key={index}
+                  className={
+                    message.role === "user"
+                      ? "ml-auto max-w-[80%] rounded-2xl bg-primary px-4 py-3 text-primary-foreground"
+                      : "max-w-[80%] rounded-2xl bg-muted px-4 py-3"
+                  }
+                >
+                  {message.role === "user" ? message.content : <Markdown content={message.content} />}
+                </div>
+              ))}
+              {sending && (
+                <div className="max-w-[80%] rounded-2xl bg-muted px-4 py-3 text-muted-foreground">
+                  Thinking...
+                </div>
+              )}
             </div>
           )}
         </Card>
 
         <form className="flex shrink-0 gap-3" onSubmit={handleSubmit}>
+          <Button type="button" variant="outline" size="icon" aria-label="Upload a file" disabled>
+            <Upload />
+          </Button>
           <Input
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
-            placeholder="Type a message..."
+            placeholder="Ask a question or upload a file..."
             disabled={sending}
           />
-          <Button type="submit" disabled={sending}>
-            Send
+          <Button type="submit" size="icon" disabled={sending} aria-label="Send message">
+            <Send />
           </Button>
         </form>
       </main>
+
+      {/* Dashboard: chart and portfolio data will be connected next. */}
+      <div className="hidden shrink-0 xl:flex">
+        <div
+          onMouseDown={startDashboardResizing}
+          className="w-1 cursor-col-resize bg-transparent hover:bg-border active:bg-border"
+          aria-label="Resize dashboard"
+        />
+        <aside
+          style={{ width: dashboardCollapsed ? 48 : dashboardWidth }}
+          className="flex shrink-0 flex-col overflow-hidden border-l bg-card transition-[width] duration-200"
+        >
+          {dashboardCollapsed ? (
+            <div className="flex h-full items-start justify-center pt-4">
+              <Button variant="ghost" size="icon-sm" aria-label="Expand dashboard" onClick={() => setDashboardCollapsed(false)}>
+                <ChevronLeft />
+              </Button>
+            </div>
+          ) : (
+            <div className="flex min-h-0 flex-1 flex-col">
+              <section className="border-b p-5">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <BarChart3 className="size-5 text-primary" />
+                    <h2 className="text-lg font-semibold">Market charts</h2>
+                  </div>
+                  <Button variant="ghost" size="icon-sm" aria-label="Collapse dashboard" onClick={() => setDashboardCollapsed(true)}>
+                    <ChevronRight />
+                  </Button>
+                </div>
+                <div className="mt-4 grid grid-cols-3 gap-2">
+                  <select
+                    className="h-9 min-w-0 rounded-md border bg-background px-2 text-sm"
+                    value={selectedCoin}
+                    onChange={(event) => setSelectedCoin(event.target.value)}
+                    aria-label="Select coin"
+                  >
+                    <option value="bitcoin">BTC</option>
+                    <option value="ethereum">ETH</option>
+                    <option value="solana">SOL</option>
+                    <option value="usd-coin">USDC</option>
+                  </select>
+                  <select
+                    className="h-9 min-w-0 rounded-md border bg-background px-2 text-sm"
+                    value={selectedMetric}
+                    onChange={(event) => setSelectedMetric(event.target.value as ChartMetric)}
+                    aria-label="Select metric"
+                  >
+                    <option value="price_usd">Price</option>
+                    <option value="daily_change_pct">Daily %</option>
+                    <option value="market_cap_usd">Market cap</option>
+                    <option value="volume_usd">Volume</option>
+                  </select>
+                  <select
+                    className="h-9 min-w-0 rounded-md border bg-background px-2 text-sm"
+                    value={selectedDays}
+                    onChange={(event) => setSelectedDays(Number(event.target.value))}
+                    aria-label="Select chart timeframe"
+                  >
+                    <option value={7}>7 days</option>
+                    <option value={30}>30 days</option>
+                    <option value={90}>90 days</option>
+                    <option value={365}>1 year</option>
+                  </select>
+                </div>
+                <div className="mt-5 flex h-52 items-center justify-center overflow-hidden rounded-lg border bg-muted/30">
+                  {chartLoading && <p className="text-sm text-muted-foreground">Loading market data…</p>}
+                  {chartError && <p className="px-4 text-center text-sm text-destructive">{chartError}</p>}
+                  {marketChart && !chartLoading && !chartError && (
+                    <Plot
+                      data={marketChart.chart.data as never}
+                      layout={{
+                        ...marketChart.chart.layout,
+                        autosize: true,
+                        paper_bgcolor: "rgba(0,0,0,0)",
+                        plot_bgcolor: "rgba(0,0,0,0)",
+                        margin: { l: 45, r: 12, t: 40, b: 35 },
+                        font: { size: 11 },
+                      } as never}
+                      config={{ displayModeBar: false, responsive: true }}
+                      useResizeHandler
+                      style={{ width: "100%", height: "100%" }}
+                    />
+                  )}
+                </div>
+                <Button variant="outline" className="mt-4 w-full" disabled>
+                  Make your own graph
+                </Button>
+              </section>
+
+              <section className="min-h-0 flex-1 p-5">
+                <h2 className="text-lg font-semibold">Portfolio</h2>
+                {portfolioLoading && (
+                  <p className="mt-4 text-sm text-muted-foreground">Loading portfolio…</p>
+                )}
+                {portfolioError && (
+                  <p className="mt-4 text-sm text-destructive">{portfolioError}</p>
+                )}
+                {portfolio && "message" in portfolio && (
+                  <div className="mt-6 rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
+                    {portfolio.message}
+                  </div>
+                )}
+                {portfolioTotal && !portfolioLoading && (
+                  <>
+                    {pricesUnavailable && (
+                      <div className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+                        {portfolio?._meta?.message ?? "Live prices are temporarily unavailable."}
+                      </div>
+                    )}
+                    {pricesUnavailable ? (
+                      <div className="mt-3 flex items-end justify-between gap-2">
+                        <p className="text-2xl font-semibold tracking-tight text-muted-foreground">
+                          {currency.format(portfolioTotal.cost_basis)}
+                        </p>
+                        <span className="text-sm text-muted-foreground">cost basis</span>
+                      </div>
+                    ) : (
+                      <>
+                        <p className="text-xs font-medium tracking-wider text-muted-foreground">PORTFOLIO TOTAL</p>
+                        <div className="mt-1 flex items-end justify-between gap-2">
+                          <p className="text-2xl font-semibold tracking-tight">
+                            {currency.format(portfolioTotal.current_value ?? 0)}
+                          </p>
+                          {portfolioTotal.today_move_percent !== null ? (
+                            <span className={portfolioTotal.today_move_percent >= 0 ? "text-sm text-emerald-600" : "text-sm text-red-600"}>
+                              {portfolioTotal.today_move_percent >= 0 ? "+" : ""}{portfolioTotal.today_move_percent.toFixed(1)}% today
+                            </span>
+                          ) : (
+                            <span className="text-sm text-muted-foreground">today's move n/a</span>
+                          )}
+                        </div>
+                        {portfolioTotal.today_move_usd !== null && (
+                          <p className={portfolioTotal.today_move_usd >= 0 ? "mt-1 text-sm text-emerald-600" : "mt-1 text-sm text-red-600"}>
+                            {portfolioTotal.today_move_usd >= 0 ? "+" : ""}{currency.format(portfolioTotal.today_move_usd)} today
+                          </p>
+                        )}
+                        <p className={(portfolioTotal.profit_loss ?? 0) >= 0 ? "mt-1 text-xs text-emerald-600/80" : "mt-1 text-xs text-red-600/80"}>
+                          {(portfolioTotal.profit_loss ?? 0) >= 0 ? "+" : ""}{currency.format(portfolioTotal.profit_loss ?? 0)} total P&amp;L ({portfolioChangePercent.toFixed(1)}%)
+                        </p>
+                        <p className="mt-4 text-[11px] leading-snug text-muted-foreground">
+                          Not financial advice — figures are informational only, based on your logged purchases and current market prices.
+                        </p>
+                      </>
+                    )}
+
+                    <div className="mt-6 flex flex-wrap gap-2">
+                      {PORTFOLIO_CHART_OPTIONS.map((option) => (
+                        <Button
+                          key={option.type}
+                          size="sm"
+                          variant={portfolioChartType === option.type ? "default" : "outline"}
+                          onClick={() => setPortfolioChartType(option.type)}
+                        >
+                          {option.label}
+                        </Button>
+                      ))}
+                    </div>
+                    <div className="mt-3 flex h-44 items-center justify-center overflow-hidden rounded-lg border bg-muted/30">
+                      {portfolioChartLoading && <p className="text-sm text-muted-foreground">Building chart…</p>}
+                      {portfolioChartError && <p className="px-4 text-center text-sm text-destructive">{portfolioChartError}</p>}
+                      {portfolioChart && !portfolioChartLoading && !portfolioChartError && (
+                        <Plot
+                          data={portfolioChart.chart.data as never}
+                          layout={{
+                            ...portfolioChart.chart.layout,
+                            autosize: true,
+                            paper_bgcolor: "rgba(0,0,0,0)",
+                            plot_bgcolor: "rgba(0,0,0,0)",
+                            margin: { l: 40, r: 12, t: 32, b: 32 },
+                            font: { size: 11 },
+                            showlegend: false,
+                          } as never}
+                          config={{ displayModeBar: false, responsive: true }}
+                          useResizeHandler
+                          style={{ width: "100%", height: "100%" }}
+                        />
+                      )}
+                    </div>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="mt-2 w-full"
+                      disabled={!portfolioChart || portfolioChartLoading}
+                      onClick={pinPortfolioChart}
+                    >
+                      Pin this chart
+                    </Button>
+
+                    {pinnedCharts.length > 0 && (
+                      <div className="mt-6 space-y-4">
+                        <p className="text-xs font-medium tracking-wider text-muted-foreground">PINNED CHARTS</p>
+                        {pinnedCharts.map((pinned) => (
+                          <div key={pinned.id} className="rounded-lg border p-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <p className="truncate text-xs font-medium">{pinned.title}</p>
+                              <Button variant="ghost" size="icon-sm" aria-label="Unpin chart" onClick={() => unpinChart(pinned.id)}>
+                                <Trash2 className="size-3.5" />
+                              </Button>
+                            </div>
+                            <div className="mt-1 h-36 overflow-hidden">
+                              <Plot
+                                data={pinned.chart.data as never}
+                                layout={{
+                                  ...pinned.chart.layout,
+                                  autosize: true,
+                                  paper_bgcolor: "rgba(0,0,0,0)",
+                                  plot_bgcolor: "rgba(0,0,0,0)",
+                                  margin: { l: 32, r: 8, t: 24, b: 24 },
+                                  font: { size: 9 },
+                                  showlegend: false,
+                                } as never}
+                                config={{ displayModeBar: false, responsive: true }}
+                                useResizeHandler
+                                style={{ width: "100%", height: "100%" }}
+                              />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    <p className="mt-6 text-xs font-medium tracking-wider text-muted-foreground">HOLDINGS</p>
+                    <div className="mt-3 space-y-4">
+                      {portfolioHoldings.map((holding) => (
+                        <div key={holding.coin} className="grid grid-cols-[auto_1fr_auto] items-center gap-3">
+                          <div className="grid size-8 place-items-center rounded-full bg-primary/10 text-xs font-semibold text-primary">
+                            {holding.coin.slice(0, 1).toUpperCase()}
+                          </div>
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-medium">{holding.coin.toUpperCase()}</p>
+                            <p className="truncate text-xs text-muted-foreground">{holding.amount.toLocaleString(undefined, { maximumFractionDigits: 6 })} {holding.coin.toUpperCase()}</p>
+                          </div>
+                          <div className="w-24 text-right">
+                            <p className="text-sm font-medium">
+                              {holding.current_value !== null ? currency.format(holding.current_value) : "—"}
+                            </p>
+                            <div className="mt-1 h-1 overflow-hidden rounded-full bg-muted">
+                              <div
+                                className="h-full rounded-full bg-primary"
+                                style={{ width: `${Math.min(holding.portfolio_weight_percent ?? 0, 100)}%` }}
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </section>
+            </div>
+          )}
+        </aside>
+      </div>
     </div>
   );
 }

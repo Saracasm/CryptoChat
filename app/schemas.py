@@ -1,7 +1,8 @@
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+from typing import Literal
 
 class ProfileCreate(BaseModel):
     name: str
@@ -31,3 +32,13 @@ class MessageRead(BaseModel):
     content: str
     seq: int
     created_at: datetime
+
+
+class VisualizationCreate(BaseModel):
+    coin: str = Field(min_length=1, max_length=100)
+    metric: Literal["price_usd", "daily_change_pct", "market_cap_usd", "volume_usd"] = "price_usd"
+    days: int = Field(default=30, ge=1, le=365)
+
+
+class PortfolioChartCreate(BaseModel):
+    chart_type: Literal["allocation", "profit_loss", "cost_vs_value"] = "allocation"

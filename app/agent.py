@@ -1,14 +1,24 @@
+import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from uuid import UUID
 import httpx
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.mcp import MCPToolset
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from app.config import settings
+from app.visualization import build_portfolio_visualization, resolve_coin_id
 from app.repository import Repository
 
 logger = logging.getLogger(__name__)
@@ -185,6 +195,9 @@ agent = Agent(
         "amount), call update_holding to fix the existing entry -- do NOT log a "
         "new one. If they want to remove a purchase, call remove_holding. "
         "When they ask how their portfolio is doing, call get_portfolio. "
+        "When they ask for a chart of their own portfolio, call "
+        "create_portfolio_chart. It can make allocation, profit/loss, or "
+        "cost-vs-current-value charts from their private holdings. "
         "You also have market-intelligence MCP tools. Use get_historical_prices "
         "for price trends, get_market_overview to explain broad market moves, "
         "get_crypto_news for recent headlines, and get_upcoming_events for "
@@ -210,6 +223,23 @@ agent = Agent(
     toolsets=[crypto_mcp_tools],
 )
 
+# Each conversation's Repository shares one SQLAlchemy async session, which
+# only supports one flush in flight at a time. If the model calls two
+# holding-writing tools in the same turn (e.g. "I bought BTC and ETH"),
+# pydantic-ai runs them concurrently and they'd race on that session and
+# crash with "Session is already flushing". A per-conversation lock
+# serializes them instead.
+_holding_locks: dict[UUID, asyncio.Lock] = {}
+
+
+def _get_holding_lock(conversation_id: UUID) -> asyncio.Lock:
+    lock = _holding_locks.get(conversation_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _holding_locks[conversation_id] = lock
+    return lock
+
+
 @agent.tool
 async def log_holding(
     ctx: RunContext[Deps], coin: str, amount: float, buy_price: float) -> str:
@@ -221,37 +251,18 @@ async def log_holding(
         buy_price: Price paid per unit in USD, e.g. 2400.
     """
     coin_id = coin.lower()
-    # Guard: don't log the same purchase twice (the model may re-read old messages).
-    already = await ctx.deps.repo.holding_exists(
-        ctx.deps.conversation_id, coin_id, amount, buy_price
-    )
-    if already:
-        return f"{amount} {coin} at ${buy_price} was already logged; skipping duplicate."
+    async with _get_holding_lock(ctx.deps.conversation_id):
+        # Guard: don't log the same purchase twice (the model may re-read old messages).
+        already = await ctx.deps.repo.holding_exists(
+            ctx.deps.conversation_id, coin_id, amount, buy_price
+        )
+        if already:
+            return f"{amount} {coin} at ${buy_price} was already logged; skipping duplicate."
 
-    await ctx.deps.repo.add_holding(
-        ctx.deps.conversation_id, coin_id, amount, buy_price
-    )
+        await ctx.deps.repo.add_holding(
+            ctx.deps.conversation_id, coin_id, amount, buy_price
+        )
     return f"Logged {amount} {coin} at ${buy_price} each."
-
-async def _resolve_coin_id(coin: str) -> str:
-    """Resolve a coin name/symbol/id (e.g. 'Bitcoin', 'BTC') to its CoinGecko id.
-
-    Tries the literal lowercased value first (it's already an id most of the
-    time), then falls back to CoinGecko's search endpoint for free-text names.
-    """
-    literal = coin.strip().lower()
-    url = "https://api.coingecko.com/api/v3/search"
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url, params={"query": coin})
-        data = resp.json()
-    coins = data.get("coins", [])
-    if not coins:
-        return literal
-
-    for c in coins:
-        if c["id"] == literal or c["symbol"].lower() == literal or c["name"].lower() == literal:
-            return c["id"]
-    return coins[0]["id"]
 
 @agent.tool
 async def update_holding(ctx: RunContext[Deps], coin:str,
@@ -266,14 +277,15 @@ async def update_holding(ctx: RunContext[Deps], coin:str,
         old_buy_price: The wrong price to find the holding by (helps pick the
             right lot when there are several).
     """
-    coin_id = await _resolve_coin_id(coin)
-    updated = await ctx.deps.repo.update_holding(
-        ctx.deps.conversation_id,
-        coin_id,
-        new_amount=new_amount,
-        new_buy_price=new_buy_price,
-        old_buy_price=old_buy_price,
-    )
+    coin_id = (await resolve_coin_id(coin))["coin_id"]
+    async with _get_holding_lock(ctx.deps.conversation_id):
+        updated = await ctx.deps.repo.update_holding(
+            ctx.deps.conversation_id,
+            coin_id,
+            new_amount=new_amount,
+            new_buy_price=new_buy_price,
+            old_buy_price=old_buy_price,
+        )
     if updated:
         return f"Updated your {coin} holding."
     return f"Couldn't find a {coin} holding to update."
@@ -286,25 +298,62 @@ async def remove_holding(
         coin: Coin name, symbol, or CoinGecko id, e.g. 'Bitcoin', 'BTC', 'bitcoin'.
         buy_price: The price of the specific lot to remove (optional).
     """
-    coin_id = await _resolve_coin_id(coin)
-    removed = await ctx.deps.repo.remove_holding(
-        ctx.deps.conversation_id, coin_id, buy_price=buy_price
-    )
+    coin_id = (await resolve_coin_id(coin))["coin_id"]
+    async with _get_holding_lock(ctx.deps.conversation_id):
+        removed = await ctx.deps.repo.remove_holding(
+            ctx.deps.conversation_id, coin_id, buy_price=buy_price
+        )
     if removed:
         return f"Removed your {coin} holding."
     return f"Couldn't find a {coin} holding to remove."
 
-@agent.tool
-async def get_portfolio(ctx: RunContext[Deps]) -> dict:
-    """Compute the portfolio with market context.
-    Returns per-coin: amount held, average buy price, current price,
-    24h market change %, cost basis (what was spent), current value,
-    and profit/loss -- plus portfolio totals. Use this to explain WHY
-    the user is up/down and how much weight their purchases carry.
+# CoinGecko's free tier rate-limits aggressively (a handful of calls/minute).
+# A short in-memory cache means repeated portfolio/chart requests within the
+# window are served without hitting CoinGecko again at all, and if a request
+# does go out and gets rate-limited or fails, we fall back to the last good
+# response instead of crashing the endpoint.
+MARKET_CACHE_TTL_SECONDS = 45
+_market_cache: dict[tuple[str, ...], tuple[float, list[dict]]] = {}
+
+
+async def _fetch_market_data(coin_ids: list[str]) -> list[dict]:
+    """Fetch CoinGecko market data (price, 24h change, etc.) for the given
+    coin ids. Never raises -- on rate limits, bad responses, or network
+    errors it logs a warning and returns the last cached result (or an
+    empty list if there's no cache yet), so callers can degrade cleanly
+    instead of crashing.
     """
-    print(f"DEBUG: user_id in state = {ctx.deps.user_id}")
-    print(f"DEBUG: conversation_id in state = {ctx.deps.conversation_id}")
-    holdings = await ctx.deps.repo.get_holdings(ctx.deps.conversation_id)
+    cache_key = tuple(sorted(coin_ids))
+    cached = _market_cache.get(cache_key)
+    if cached and time.monotonic() - cached[0] < MARKET_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    stale_fallback = cached[1] if cached else []
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                url, params={"vs_currency": "usd", "ids": ",".join(cache_key)}
+            )
+        if resp.status_code == 429:
+            logger.warning("CoinGecko rate limit hit; using stale/empty market data")
+            return stale_fallback
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list):
+            logger.warning("CoinGecko returned an unexpected payload: %r", data)
+            return stale_fallback
+    except httpx.HTTPError as exc:
+        logger.warning("CoinGecko request failed: %s", exc)
+        return stale_fallback
+
+    _market_cache[cache_key] = (time.monotonic(), data)
+    return data
+
+
+async def get_portfolio_report(repo: Repository, conversation_id: UUID) -> dict:
+    """Compute the current market value and performance of one portfolio."""
+    holdings = await repo.get_holdings(conversation_id)
     if not holdings:
         return {"message": "No holdings recorded yet."}
 
@@ -315,27 +364,44 @@ async def get_portfolio(ctx: RunContext[Deps]) -> dict:
         p["cost"] += float(h.amount) * float(h.buy_price)
 
     # One CoinGecko call gets price + 24h change + rank for every coin.
-    ids = ",".join(positions.keys())
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            url, params={"vs_currency": "usd", "ids": ids}
-        )
-        market = resp.json()
-
-    # Index market data by coin id for easy lookup.
-    market_by_id = {m["id"]: m for m in market}
+    market = await _fetch_market_data(list(positions.keys()))
+    market_by_id = {m["id"]: m for m in market if isinstance(m, dict) and "id" in m}
+    prices_unavailable = not market_by_id
 
     report = {}
     total_value = 0.0
     total_cost = 0.0
+    # Portfolio-wide "today's move": back out yesterday's value per coin from
+    # its 24h % change, sum both sides, then diff -- a simple $ change would
+    # instead double-count cost basis, so this only uses coins with known
+    # current value and a known 24h change.
+    value_today_with_change = 0.0
+    value_yesterday_with_change = 0.0
     for coin, p in positions.items():
-        m = market_by_id.get(coin, {})
+        avg_cost = p["cost"] / p["amount"] if p["amount"] else 0
+        m = market_by_id.get(coin)
+
+        if m is None and prices_unavailable:
+            # CoinGecko is down/rate-limited entirely -- report what we
+            # actually know (cost basis) and mark the rest as unknown
+            # rather than showing a fabricated $0 value / -100% loss.
+            report[coin] = {
+                "amount": round(p["amount"], 8),
+                "avg_buy_price": round(avg_cost, 2),
+                "current_price": None,
+                "change_24h_percent": None,
+                "cost_basis": round(p["cost"], 2),
+                "current_value": None,
+                "profit_loss": None,
+            }
+            total_cost += p["cost"]
+            continue
+
+        m = m or {}
         price = m.get("current_price", 0) or 0
         change_24h = m.get("price_change_percentage_24h")
         value = p["amount"] * price
         pnl = value - p["cost"]
-        avg_cost = p["cost"] / p["amount"] if p["amount"] else 0
         report[coin] = {
             "amount": round(p["amount"], 8),
             "avg_buy_price": round(avg_cost, 2),
@@ -349,20 +415,76 @@ async def get_portfolio(ctx: RunContext[Deps]) -> dict:
         }
         total_value += value
         total_cost += p["cost"]
+        if change_24h is not None and (1 + change_24h / 100) != 0:
+            value_today_with_change += value
+            value_yesterday_with_change += value / (1 + change_24h / 100)
 
     # Add allocation % so the model can talk about "weight" per coin.
     for coin in positions:
         v = report[coin]["current_value"]
         report[coin]["portfolio_weight_percent"] = (
-            round(v / total_value * 100, 1) if total_value else 0
+            round(v / total_value * 100, 1) if total_value and v is not None else None
         )
 
-    report["_total"] = {
-        "cost_basis": round(total_cost, 2),
-        "current_value": round(total_value, 2),
-        "profit_loss": round(total_value - total_cost, 2),
-    }
+    if prices_unavailable:
+        report["_total"] = {
+            "cost_basis": round(total_cost, 2),
+            "current_value": None,
+            "profit_loss": None,
+        }
+        report["_meta"] = {
+            "prices_unavailable": True,
+            "message": (
+                "Live prices are temporarily unavailable (market data "
+                "provider is rate-limited or unreachable) -- showing "
+                "logged cost basis only."
+            ),
+        }
+    else:
+        today_move_usd = None
+        today_move_percent = None
+        if value_yesterday_with_change:
+            today_move_usd = round(value_today_with_change - value_yesterday_with_change, 2)
+            today_move_percent = round(
+                (value_today_with_change - value_yesterday_with_change)
+                / value_yesterday_with_change * 100, 2,
+            )
+        report["_total"] = {
+            "cost_basis": round(total_cost, 2),
+            "current_value": round(total_value, 2),
+            "profit_loss": round(total_value - total_cost, 2),
+            "today_move_usd": today_move_usd,
+            "today_move_percent": today_move_percent,
+        }
     return report
+
+
+@agent.tool
+async def get_portfolio(ctx: RunContext[Deps]) -> dict:
+    """Get the current private portfolio with market context and P&L."""
+    return await get_portfolio_report(ctx.deps.repo, ctx.deps.conversation_id)
+
+
+@agent.tool
+async def create_portfolio_chart(
+    ctx: RunContext[Deps], chart_type: str = "allocation"
+) -> dict:
+    """Create a private chart from the current conversation's portfolio.
+
+    Args:
+        chart_type: One of allocation, profit_loss, or cost_vs_value.
+    """
+    allowed_chart_types = {"allocation", "profit_loss", "cost_vs_value"}
+    if chart_type not in allowed_chart_types:
+        return {"error": f"chart_type must be one of: {', '.join(sorted(allowed_chart_types))}"}
+    portfolio = await get_portfolio_report(ctx.deps.repo, ctx.deps.conversation_id)
+    if "message" in portfolio:
+        return portfolio
+    try:
+        return build_portfolio_visualization(portfolio, chart_type).model_dump()
+    except ValueError as exc:
+        return {"error": str(exc)}
+
 
 @agent.tool
 async def write_sql_query(ctx: RunContext[Deps], task: str) -> str:
@@ -403,6 +525,24 @@ def _to_model_messages(history: list[dict]) -> list[ModelMessage]:
             messages.append(ModelResponse(parts=[TextPart(content=m["content"])]))
     return messages
 
+# Tool calls whose output feeds risk/performance judgments -- if the model
+# used one of these to answer, we append a disclaimer to the reply
+# ourselves rather than trusting the model to remember to add it every time.
+RISK_SIGALING_TOOLS = {"get_portfolio_risk", "get_portfolio"}
+NOT_FINANCIAL_ADVICE_NOTE = (
+    "\n\n_Not financial advice: this is an automated summary of your logged "
+    "data and public market info, not a recommendation to buy, sell, or hold._"
+)
+
+
+def _used_risk_tool(messages: list[ModelMessage]) -> bool:
+    for message in messages:
+        for part in getattr(message, "parts", []):
+            if isinstance(part, ToolCallPart) and part.tool_name in RISK_SIGALING_TOOLS:
+                return True
+    return False
+
+
 async def get_reply(
     repo: Repository, conversation_id: UUID, history: list[dict], user_id: UUID | None = None
 ) -> str:
@@ -411,7 +551,10 @@ async def get_reply(
     latest = history[-1]["content"]
     message_history = _to_model_messages(history)
     result = await agent.run(latest, deps=deps, message_history=message_history)
-    return result.output
+    reply = result.output
+    if _used_risk_tool(result.new_messages()) and "not financial advice" not in reply.lower():
+        reply += NOT_FINANCIAL_ADVICE_NOTE
+    return reply
 
 
 async def summarize_title(history: list[dict]) -> str:
