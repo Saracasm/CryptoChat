@@ -2,9 +2,11 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from typing import Literal
 from uuid import UUID
 import httpx
 import pandas as pd
+from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.mcp import MCPToolset
@@ -20,7 +22,13 @@ from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from app.config import settings
 from app.embeddings import embed_query
-from app.visualization import build_portfolio_visualization, resolve_coin_id
+from app.sandbox import SandboxError, run_sandboxed_async, validate_code
+from app.visualization import (
+    build_multi_coin_dataframe,
+    build_portfolio_visualization,
+    portfolio_dataframe,
+    resolve_coin_id,
+)
 from app.repository import Repository
 
 logger = logging.getLogger(__name__)
@@ -122,6 +130,141 @@ async def generate_chart_code(prompt: str, columns: list[str]) -> str:
         if code.startswith("python"):
             code = code[len("python"):]
     return code.strip()
+
+
+class VisualizationPlan(BaseModel):
+    """Structured output of visualization_planner_agent: which data source,
+    chart shape, and fields answer a free-text chart request -- decided
+    before any code is generated, so the code-gen step has a concrete,
+    grounded target instead of guessing from the raw request alone."""
+
+    data_source: Literal["portfolio", "market"]
+    chart_type: Literal["donut", "bar", "grouped_bar", "line", "multi_line"]
+    coins: list[str] = Field(default_factory=list)
+    # Plain str, not a Literal: this only matters for a single-coin market
+    # line chart, so for portfolio requests the model sometimes fills it
+    # with an unrelated (but harmless) value like a portfolio column name --
+    # a Literal would make that a hard validation failure for no reason,
+    # since nothing downstream actually reads this field today.
+    metric: str = "price_usd"
+    # Deliberately unconstrained (no ge/le): some OpenRouter providers reject
+    # tool schemas containing JSON Schema "minimum"/"maximum" keywords. The
+    # 1-365 range is enforced downstream instead, in build_multi_coin_dataframe.
+    days: int = 30
+    x_field: str
+    y_field: str
+    reasoning: str
+
+
+PORTFOLIO_DATAFRAME_COLUMNS = (
+    "coin, amount, buy_price/cost_basis, current_price, current_value, "
+    "profit_loss, portfolio_weight_percent, change_24h_percent"
+)
+MARKET_DATAFRAME_COLUMNS = "date, coin, price_usd, daily_change_pct, market_cap_usd, volume_usd"
+
+visualization_planner_agent = Agent(
+    model,
+    deps_type=Deps,
+    # Plain string output, not output_type=VisualizationPlan: pydantic-ai's
+    # native structured output forces a tool_choice the configured free
+    # OpenRouter model doesn't support ("inference-enforced tool_choice is
+    # not supported"). Every other agent in this file has the same
+    # constraint, which is why they all reply in a parsed text format
+    # instead -- this one replies with a JSON object we validate ourselves.
+    instructions=(
+        "You plan a chart for a crypto portfolio app from a user's plain-English "
+        "request. Choose exactly one data source:\n"
+        f"- 'portfolio': the user's own private holdings (columns: "
+        f"{PORTFOLIO_DATAFRAME_COLUMNS}). Use this for requests about the "
+        "user's own allocation, gains/losses, or holdings -- e.g. 'show my "
+        "allocation', 'which coin hurt me most'.\n"
+        f"- 'market': public historical price data for one or more coins "
+        f"(columns: {MARKET_DATAFRAME_COLUMNS}). Use this for trend, "
+        "comparison, or volatility requests about the market itself -- e.g. "
+        "'compare BTC and ETH this month', 'show daily volatility'.\n"
+        "Pick chart_type from: 'donut' (share of a whole, e.g. allocation), "
+        "'bar' (one series across categories, e.g. P&L by coin), "
+        "'grouped_bar' (two series per category, e.g. cost basis vs current "
+        "value, or daily % change), 'line' (one coin's trend over time), "
+        "'multi_line' (several coins' trends over time, for comparisons). "
+        "Set x_field and y_field to exact column names from the chosen data "
+        "source's column list above -- never invent a column. "
+        "For 'market', set coins to the CoinGecko-recognizable coin name(s) "
+        "or ticker(s) mentioned (e.g. ['bitcoin', 'ethereum']); use a single "
+        "coin if only one is mentioned or implied. Set days to a sensible "
+        "window (default 30) based on wording like 'this week' (7) or 'this "
+        "month' (30). metric only matters for a single-coin market line "
+        "chart. Briefly justify the choice in reasoning.\n\n"
+        "Reply with ONLY a single JSON object, no markdown fences, no "
+        "explanation outside it, with exactly these keys: "
+        '"data_source" ("portfolio" or "market"), '
+        '"chart_type" ("donut", "bar", "grouped_bar", "line", or "multi_line"), '
+        '"coins" (list of strings, [] for portfolio), '
+        '"metric" ("price_usd", "daily_change_pct", "market_cap_usd", or "volume_usd"), '
+        '"days" (integer), "x_field" (string), "y_field" (string), '
+        '"reasoning" (short string).'
+    ),
+)
+
+
+async def plan_visualization(deps: Deps, request: str) -> dict:
+    """Plan then build a chart from a free-text request: pick a data source
+    (the caller's private portfolio, or public market history), a chart
+    shape, and x/y fields, then generate and sandbox-execute the Plotly/
+    pandas code for it. Returns {plan, dataframe, code, chart} or {"error"}
+    on any failure along the way -- never raises for a bad/ambiguous
+    request, since this is called directly from both a chat tool and a REST
+    endpoint that both need a clean error message rather than a 500.
+    """
+    plan_result = await visualization_planner_agent.run(request, deps=deps)
+    raw_plan = plan_result.output.strip()
+    if raw_plan.startswith("```"):
+        raw_plan = raw_plan.strip("`")
+        if raw_plan.startswith("json"):
+            raw_plan = raw_plan[len("json"):]
+    try:
+        plan = VisualizationPlan.model_validate_json(raw_plan.strip())
+    except Exception as exc:
+        return {"error": f"Couldn't plan a chart for that request: {exc}"}
+
+    if plan.data_source == "portfolio":
+        if deps.repo is None or deps.conversation_id is None:
+            return {"error": "No active conversation to read portfolio data from."}
+        portfolio = await get_portfolio_report(deps.repo, deps.conversation_id)
+        if "message" in portfolio:
+            return portfolio
+        rows = portfolio_dataframe(portfolio)
+        if not rows:
+            return {"error": "No portfolio holdings are available to chart yet."}
+    else:
+        coins = plan.coins or ["bitcoin"]
+        try:
+            rows = await build_multi_coin_dataframe(coins, plan.days)
+        except (ValueError, httpx.HTTPError) as exc:
+            return {"error": f"Couldn't fetch market data: {exc}"}
+
+    columns = list(rows[0].keys())
+    multi_series = plan.data_source == "market" and len({row.get("coin") for row in rows}) > 1
+    chart_prompt = (
+        f"{request}\n\nBuild a '{plan.chart_type}' chart using x='{plan.x_field}' "
+        f"and y='{plan.y_field}'."
+        + (" Color/group traces by the 'coin' column -- multiple coins are involved." if multi_series else "")
+        + (
+            " The 'date' column is already a plain 'YYYY-MM-DD' string -- pass "
+            "it straight to plotly as-is, do not parse it, convert it, or do "
+            "any date/Timedelta arithmetic on it."
+            if plan.data_source == "market" else ""
+        )
+    )
+
+    try:
+        code = await generate_chart_code(chart_prompt, columns)
+        validate_code(code)
+        chart = await run_sandboxed_async(code, {"df": rows})
+    except SandboxError as exc:
+        return {"error": str(exc)}
+
+    return {"plan": plan.model_dump(), "dataframe": rows, "code": code, "chart": chart}
 
 
 dataframe_summarizer_agent = Agent(
@@ -357,6 +500,11 @@ agent = Agent(
         "When they ask for a chart of their own portfolio, call "
         "create_portfolio_chart. It can make allocation, profit/loss, or "
         "cost-vs-current-value charts from their private holdings. "
+        "For other chart requests -- comparing multiple coins' price "
+        "history (e.g. 'compare BTC and ETH this month'), a single coin's "
+        "trend, or daily volatility -- call create_visualization with the "
+        "request in the user's own words; it picks the right data source, "
+        "chart type, and fields itself. "
         "You also have market-intelligence MCP tools. Use get_historical_prices "
         "for price trends, get_market_overview to explain broad market moves, "
         "get_crypto_news for recent headlines, and get_upcoming_events for "
@@ -650,6 +798,23 @@ async def create_portfolio_chart(
         return build_portfolio_visualization(portfolio, chart_type).model_dump()
     except ValueError as exc:
         return {"error": str(exc)}
+
+
+@agent.tool
+async def create_visualization(ctx: RunContext[Deps], request: str) -> dict:
+    """Plan and build a chart from an open-ended request, choosing between
+    the user's private portfolio and public market history as the data
+    source. Use this for chart requests create_portfolio_chart's fixed
+    allocation/profit_loss/cost_vs_value types don't cover -- e.g. comparing
+    multiple coins' price history, or daily volatility. For a simple
+    portfolio allocation/P&L/cost-vs-value chart, prefer
+    create_portfolio_chart instead.
+
+    Args:
+        request: The user's chart request in their own words, e.g.
+            "compare BTC and ETH this month" or "show daily volatility".
+    """
+    return await plan_visualization(ctx.deps, request)
 
 
 @agent.tool

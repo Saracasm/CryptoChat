@@ -64,6 +64,7 @@ class CustomChartResult(BaseModel):
     dataframe: str
     code: str
     chart: dict
+    plan: dict | None = None
 
 
 class DocumentUploadResult(BaseModel):

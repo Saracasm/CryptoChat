@@ -5,9 +5,10 @@ import httpx
 
 from app.agent import (
     CONTEXT_WINDOW,
-    generate_chart_code,
+    Deps,
     get_portfolio_report,
     get_reply,
+    plan_visualization,
     summarize_title,
 )
 from app.dependencies import get_current_profile, get_repository
@@ -211,9 +212,12 @@ async def create_custom_chart(
     profile: Profile = Depends(get_current_profile),
     repo: Repository = Depends(get_repository),
 ):
-    """"Make your own graph": run user- or AI-written pandas/plotly code
-    against a private dataframe, sandboxed (see app/sandbox.py) -- never
-    executed directly in this process's own interpreter.
+    """"Make your own graph": either run user-written code against the
+    private portfolio dataframe, or -- when only a `prompt` is given --
+    delegate to the visualization planner, which can also reach for public
+    market history, not just the portfolio. Code (whichever path produced
+    it) always runs sandboxed (see app/sandbox.py), never directly in this
+    process's own interpreter.
     """
     conversation = await repo.get_conversation(profile.id, conversation_id)
     if conversation is None:
@@ -221,21 +225,32 @@ async def create_custom_chart(
     if not body.code and not body.prompt:
         raise HTTPException(status_code=422, detail="Provide either `code` or `prompt`.")
 
-    portfolio = await get_portfolio_report(repo, conversation_id)
-    rows = portfolio_dataframe(portfolio) if "message" not in portfolio else []
-    if not rows:
-        raise HTTPException(status_code=422, detail="No portfolio data available to chart yet.")
-    columns = list(rows[0].keys())
+    if body.code:
+        portfolio = await get_portfolio_report(repo, conversation_id)
+        rows = portfolio_dataframe(portfolio) if "message" not in portfolio else []
+        if not rows:
+            raise HTTPException(status_code=422, detail="No portfolio data available to chart yet.")
+        try:
+            validate_code(body.code)
+            chart = await run_sandboxed_async(body.code, {"df": rows})
+        except SandboxError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return CustomChartResult(dataframe=body.dataframe, code=body.code, chart=chart)
 
-    code = body.code or await generate_chart_code(body.prompt, columns)
-
-    try:
-        validate_code(code)
-        chart = await run_sandboxed_async(code, {"df": rows})
-    except SandboxError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    return CustomChartResult(dataframe=body.dataframe, code=code, chart=chart)
+    result = await plan_visualization(
+        Deps(repo=repo, conversation_id=conversation_id, user_id=profile.id), body.prompt
+    )
+    if "error" in result:
+        raise HTTPException(status_code=422, detail=result["error"])
+    if "message" in result:
+        raise HTTPException(status_code=422, detail=result["message"])
+    plan = result["plan"]
+    return CustomChartResult(
+        dataframe=f"{plan['data_source']}:{','.join(plan['coins']) or 'own holdings'}",
+        code=result["code"],
+        chart=result["chart"],
+        plan=plan,
+    )
 
 
 @conversations_router.post("/{conversation_id}/visualizations", response_model=VisualizationResult)

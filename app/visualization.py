@@ -6,6 +6,7 @@ executed by the API; this avoids running untrusted user or model Python in the
 FastAPI process.
 """
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -172,6 +173,53 @@ async def build_market_visualization(
         chart=_plotly_chart(metric, title, dataframe),
         python_code=_python_code(metric, title),
     )
+
+
+MARKET_DATAFRAME_COLUMNS = [
+    "date", "coin", "price_usd", "daily_change_pct", "market_cap_usd", "volume_usd",
+]
+
+
+async def build_multi_coin_dataframe(coins: list[str], days: int = 30) -> list[dict]:
+    """Fetch daily market history for one or more coins and return a single
+    long-format dataframe (one row per coin per day: date, coin, price_usd,
+    daily_change_pct, market_cap_usd, volume_usd). Powers both single-coin
+    trend charts and multi-coin comparisons (e.g. "compare BTC and ETH this
+    month") from the same shape.
+    """
+    if not 1 <= days <= 365:
+        raise ValueError("days must be between 1 and 365")
+    if not coins:
+        raise ValueError("At least one coin is required.")
+
+    market_charts = await asyncio.gather(
+        *(get_market_chart(coin, days, interval="daily") for coin in coins)
+    )
+
+    rows: list[dict] = []
+    for market_chart in market_charts:
+        coin_name = market_chart["coin"]["name"]
+        data = market_chart["data"]
+        market_cap_by_time = dict(data.get("market_caps", []))
+        volume_by_time = dict(data.get("total_volumes", []))
+        previous_price: float | None = None
+        for timestamp, price in data.get("prices", []):
+            row = {
+                "date": datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc).date().isoformat(),
+                "coin": coin_name,
+                "price_usd": round(price, 8),
+                "market_cap_usd": round(market_cap_by_time.get(timestamp, 0), 2),
+                "volume_usd": round(volume_by_time.get(timestamp, 0), 2),
+            }
+            row["daily_change_pct"] = (
+                round((price / previous_price - 1) * 100, 4) if previous_price else 0.0
+            )
+            previous_price = price
+            rows.append(row)
+
+    if not rows:
+        raise ValueError(f"No historical market data found for {', '.join(coins)}.")
+    return rows
 
 
 def portfolio_dataframe(portfolio: dict) -> list[dict]:
