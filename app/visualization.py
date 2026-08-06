@@ -174,17 +174,26 @@ async def build_market_visualization(
     )
 
 
-def build_portfolio_visualization(
-    portfolio: dict, chart_type: PortfolioChartType = "allocation"
-) -> PortfolioVisualizationResult:
-    """Build a chart from private portfolio data already fetched by the agent."""
-    dataframe = [
+def portfolio_dataframe(portfolio: dict) -> list[dict]:
+    """Reshape a get_portfolio_report() dict into per-coin rows, dropping
+    the `_total`/`_meta` bookkeeping keys. Shared by the built-in portfolio
+    charts and the "make your own graph" custom-chart dataframe -- one
+    place defines what "the portfolio dataframe" means.
+    """
+    return [
         {"coin": coin, **position}
         for coin, position in portfolio.items()
         if coin not in ("_total", "_meta")
         and isinstance(position, dict)
         and position.get("current_value") is not None
     ]
+
+
+def build_portfolio_visualization(
+    portfolio: dict, chart_type: PortfolioChartType = "allocation"
+) -> PortfolioVisualizationResult:
+    """Build a chart from private portfolio data already fetched by the agent."""
+    dataframe = portfolio_dataframe(portfolio)
     if not dataframe:
         if portfolio.get("_meta", {}).get("prices_unavailable"):
             raise ValueError(

@@ -44,6 +44,28 @@ class PortfolioChartCreate(BaseModel):
     chart_type: Literal["allocation", "profit_loss", "cost_vs_value"] = "allocation"
 
 
+class DataframeInfo(BaseModel):
+    columns: list[str]
+    row_count: int
+    preview: list[dict]
+
+
+class DataframeListResult(BaseModel):
+    dataframes: dict[str, DataframeInfo]
+
+
+class CustomChartRequest(BaseModel):
+    dataframe: Literal["portfolio"] = "portfolio"
+    code: str | None = Field(default=None, max_length=4000)
+    prompt: str | None = Field(default=None, max_length=500)
+
+
+class CustomChartResult(BaseModel):
+    dataframe: str
+    code: str
+    chart: dict
+
+
 class DocumentUploadResult(BaseModel):
     document_id: UUID
     filename: str

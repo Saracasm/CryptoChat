@@ -76,6 +76,21 @@ type PinnedChart = {
   };
 };
 
+type DataframeInfo = {
+  columns: string[];
+  row_count: number;
+  preview: Record<string, unknown>[];
+};
+
+type CustomChartResult = {
+  dataframe: string;
+  code: string;
+  chart: {
+    data: object[];
+    layout: object;
+  };
+};
+
 type UploadedDocument = {
   id: string;
   filename: string;
@@ -128,6 +143,16 @@ export default function ChatInterface() {
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  const [customChartOpen, setCustomChartOpen] = useState(false);
+  const [dataframeInfo, setDataframeInfo] = useState<DataframeInfo | null>(null);
+  const [dataframeLoading, setDataframeLoading] = useState(false);
+  const [dataframeError, setDataframeError] = useState<string | null>(null);
+  const [customChartCode, setCustomChartCode] = useState("");
+  const [customChartPrompt, setCustomChartPrompt] = useState("");
+  const [customChartResult, setCustomChartResult] = useState<CustomChartResult | null>(null);
+  const [customChartRunning, setCustomChartRunning] = useState(false);
+  const [customChartGenerating, setCustomChartGenerating] = useState(false);
+  const [customChartError, setCustomChartError] = useState<string | null>(null);
   const resizingPanel = useRef<"sidebar" | "dashboard" | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -300,6 +325,91 @@ export default function ChatInterface() {
     } finally {
       setUploading(false);
     }
+  }
+
+  async function openCustomChartModal() {
+    setCustomChartOpen(true);
+    if (dataframeInfo || !profileId || !conversationId) return;
+    setDataframeLoading(true);
+    setDataframeError(null);
+    try {
+      const response = await fetch(`/api/conversations/${conversationId}/dataframes`, {
+        headers: { "X-Profile-Id": profileId },
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail ?? "Unable to load available data.");
+      const portfolio = data.dataframes?.portfolio as DataframeInfo | undefined;
+      if (!portfolio) {
+        setDataframeError("No portfolio data yet — log a purchase first.");
+        return;
+      }
+      setDataframeInfo(portfolio);
+      if (!customChartCode) {
+        setCustomChartCode(
+          `fig = px.bar(df, x="coin", y="current_value", title="Current value by coin")`
+        );
+      }
+    } catch (error) {
+      setDataframeError(error instanceof Error ? error.message : "Unable to load available data.");
+    } finally {
+      setDataframeLoading(false);
+    }
+  }
+
+  function closeCustomChartModal() {
+    setCustomChartOpen(false);
+  }
+
+  async function runCustomChart(code: string) {
+    if (!profileId || !conversationId || !code.trim()) return;
+    setCustomChartRunning(true);
+    setCustomChartError(null);
+    try {
+      const response = await fetch(`/api/conversations/${conversationId}/custom-chart`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Profile-Id": profileId },
+        body: JSON.stringify({ code }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail ?? "Unable to run this code.");
+      setCustomChartResult(data);
+      setCustomChartCode(data.code);
+    } catch (error) {
+      setCustomChartResult(null);
+      setCustomChartError(error instanceof Error ? error.message : "Unable to run this code.");
+    } finally {
+      setCustomChartRunning(false);
+    }
+  }
+
+  async function generateChartWithAI() {
+    if (!profileId || !conversationId || !customChartPrompt.trim()) return;
+    setCustomChartGenerating(true);
+    setCustomChartError(null);
+    try {
+      const response = await fetch(`/api/conversations/${conversationId}/custom-chart`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Profile-Id": profileId },
+        body: JSON.stringify({ prompt: customChartPrompt }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail ?? "Unable to generate a chart for that.");
+      setCustomChartResult(data);
+      setCustomChartCode(data.code);
+    } catch (error) {
+      setCustomChartResult(null);
+      setCustomChartError(error instanceof Error ? error.message : "Unable to generate a chart for that.");
+    } finally {
+      setCustomChartGenerating(false);
+    }
+  }
+
+  function pinCustomChart() {
+    if (!customChartResult) return;
+    setPinnedCharts((current) => [
+      ...current,
+      { id: `${Date.now()}`, title: "Custom graph", chart: customChartResult.chart },
+    ]);
   }
 
   async function loadConversationList(pid: string) {
@@ -687,7 +797,12 @@ export default function ChatInterface() {
                     />
                   )}
                 </div>
-                <Button variant="outline" className="mt-4 w-full" disabled>
+                <Button
+                  variant="outline"
+                  className="mt-4 w-full"
+                  disabled={!profileId || !conversationId}
+                  onClick={openCustomChartModal}
+                >
                   Make your own graph
                 </Button>
               </section>
@@ -911,6 +1026,112 @@ export default function ChatInterface() {
           )}
         </aside>
       </div>
+
+      {customChartOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <Card className="flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden p-0">
+            <div className="flex items-center justify-between border-b p-4">
+              <h2 className="text-lg font-semibold">Make your own graph</h2>
+              <Button variant="ghost" size="icon-sm" aria-label="Close" onClick={closeCustomChartModal}>
+                ✕
+              </Button>
+            </div>
+
+            <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
+              <div>
+                <p className="text-xs font-medium tracking-wider text-muted-foreground">DATAFRAME</p>
+                {dataframeLoading && <p className="mt-2 text-sm text-muted-foreground">Loading your data…</p>}
+                {dataframeError && <p className="mt-2 text-sm text-destructive">{dataframeError}</p>}
+                {dataframeInfo && (
+                  <>
+                    <p className="mt-2 text-sm">
+                      <span className="font-medium">df</span> — portfolio, {dataframeInfo.row_count} row
+                      {dataframeInfo.row_count === 1 ? "" : "s"}
+                    </p>
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      {dataframeInfo.columns.map((column) => (
+                        <code key={column} className="rounded bg-muted px-1.5 py-0.5 text-xs">
+                          {column}
+                        </code>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
+
+              <div>
+                <p className="text-xs font-medium tracking-wider text-muted-foreground">ASK AI</p>
+                <div className="mt-2 flex gap-2">
+                  <Input
+                    value={customChartPrompt}
+                    onChange={(event) => setCustomChartPrompt(event.target.value)}
+                    placeholder="e.g. show my allocation as a donut chart"
+                    disabled={customChartGenerating}
+                  />
+                  <Button
+                    onClick={generateChartWithAI}
+                    disabled={customChartGenerating || !customChartPrompt.trim() || !dataframeInfo}
+                  >
+                    {customChartGenerating ? "Generating…" : "Generate"}
+                  </Button>
+                </div>
+              </div>
+
+              <div>
+                <p className="text-xs font-medium tracking-wider text-muted-foreground">CODE</p>
+                <textarea
+                  value={customChartCode}
+                  onChange={(event) => setCustomChartCode(event.target.value)}
+                  rows={6}
+                  spellCheck={false}
+                  className="mt-2 w-full rounded-lg border bg-background p-3 font-mono text-xs"
+                  placeholder='fig = px.bar(df, x="coin", y="current_value")'
+                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  Only pandas (pd) and plotly.express/graph_objects (px/go) are available — no imports,
+                  files, or network calls. Assign your chart to a variable named <code>fig</code>.
+                </p>
+              </div>
+
+              <div className="flex gap-2">
+                <Button
+                  onClick={() => runCustomChart(customChartCode)}
+                  disabled={customChartRunning || !customChartCode.trim() || !dataframeInfo}
+                >
+                  {customChartRunning ? "Running…" : "Run"}
+                </Button>
+                <Button variant="outline" onClick={pinCustomChart} disabled={!customChartResult}>
+                  Pin to dashboard
+                </Button>
+              </div>
+
+              {customChartError && <p className="text-sm text-destructive">{customChartError}</p>}
+
+              <div className="flex h-64 items-center justify-center overflow-hidden rounded-lg border bg-muted/30">
+                {!customChartResult && !customChartError && (
+                  <p className="text-sm text-muted-foreground">Run some code to see your chart here.</p>
+                )}
+                {customChartResult && (
+                  <Plot
+                    data={customChartResult.chart.data as never}
+                    layout={{
+                      ...customChartResult.chart.layout,
+                      autosize: true,
+                      paper_bgcolor: "rgba(0,0,0,0)",
+                      plot_bgcolor: "rgba(0,0,0,0)",
+                      margin: { l: 45, r: 20, t: 40, b: 40 },
+                      font: { size: 11 },
+                    } as never}
+                    config={{ displayModeBar: false, responsive: true }}
+                    useResizeHandler
+                    style={{ width: "100%", height: "100%" }}
+                  />
+                )}
+              </div>
+            </div>
+          </Card>
+        </div>
+      )}
     </div>
   );
 }
