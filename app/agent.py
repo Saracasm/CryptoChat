@@ -88,6 +88,41 @@ def add_schema_context(ctx: RunContext[Deps]) -> str:
     )
 
 
+chart_code_agent = Agent(
+    model,
+    deps_type=Deps,
+    instructions=(
+        "You write a single short Python snippet that builds one Plotly "
+        "chart from a pandas DataFrame already available as the variable "
+        "`df`. You may only use `pd` (pandas) and `px` (plotly.express) or "
+        "`go` (plotly.graph_objects) -- both already imported; never write "
+        "an import statement yourself. Only reference the exact columns "
+        "you are told exist on `df` -- never invent a column. Assign the "
+        "final chart to a variable named `fig`. Do not call `.show()`, "
+        "`.write_html()`, or anything that touches a file or the network. "
+        "Do not define functions or classes, and do not use try/except or "
+        "while loops -- straight-line code (and simple for/if) only. "
+        "Reply with ONLY the code, no explanation, no markdown code fences."
+    ),
+)
+
+
+async def generate_chart_code(prompt: str, columns: list[str]) -> str:
+    """Ask the model for a sandboxed pandas/plotly snippet answering `prompt`
+    against a dataframe with the given columns. Returned code still goes
+    through app.sandbox.validate_code before ever being executed -- this
+    function does not itself guarantee safe output.
+    """
+    task = f"Available columns on `df`: {', '.join(columns)}.\nUser request: {prompt}"
+    result = await chart_code_agent.run(task, deps=Deps(repo=None, conversation_id=None))
+    code = result.output.strip()
+    if code.startswith("```"):
+        code = code.strip("`")
+        if code.startswith("python"):
+            code = code[len("python"):]
+    return code.strip()
+
+
 CONTEXT_WINDOW = 6
 
 summary_cache: dict[UUID, tuple[str, int]] = {}

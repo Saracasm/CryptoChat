@@ -3,13 +3,23 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 import httpx
 
-from app.agent import CONTEXT_WINDOW, get_portfolio_report, get_reply, summarize_title
+from app.agent import (
+    CONTEXT_WINDOW,
+    generate_chart_code,
+    get_portfolio_report,
+    get_reply,
+    summarize_title,
+)
 from app.dependencies import get_current_profile, get_repository
 from app.ingest import ingest_document
 from app.models import Profile
 from app.repository import Repository
+from app.sandbox import SandboxError, run_sandboxed_async, validate_code
 from app.schemas import (
     ConversationRead,
+    CustomChartRequest,
+    CustomChartResult,
+    DataframeListResult,
     DocumentRead,
     DocumentUploadResult,
     MessageCreate,
@@ -24,6 +34,7 @@ from app.visualization import (
     VisualizationResult,
     build_market_visualization,
     build_portfolio_visualization,
+    portfolio_dataframe,
 )
 
 profiles_router = APIRouter(prefix="/profiles", tags=["profiles"])
@@ -156,6 +167,75 @@ async def create_portfolio_chart_endpoint(
         return build_portfolio_visualization(portfolio, body.chart_type)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@conversations_router.get(
+    "/{conversation_id}/dataframes", response_model=DataframeListResult
+)
+async def list_dataframes(
+    conversation_id: UUID,
+    profile: Profile = Depends(get_current_profile),
+    repo: Repository = Depends(get_repository),
+):
+    """What "Make your own graph" can currently plot: the private portfolio
+    dataframe (same shape the built-in portfolio charts use), with its
+    columns and a small preview so the UI can show what's available
+    without shipping the full dataset up front.
+    """
+    conversation = await repo.get_conversation(profile.id, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    portfolio = await get_portfolio_report(repo, conversation_id)
+    rows = portfolio_dataframe(portfolio) if "message" not in portfolio else []
+    if not rows:
+        return DataframeListResult(dataframes={})
+
+    return DataframeListResult(
+        dataframes={
+            "portfolio": {
+                "columns": list(rows[0].keys()),
+                "row_count": len(rows),
+                "preview": rows[:3],
+            }
+        }
+    )
+
+
+@conversations_router.post(
+    "/{conversation_id}/custom-chart", response_model=CustomChartResult
+)
+async def create_custom_chart(
+    conversation_id: UUID,
+    body: CustomChartRequest,
+    profile: Profile = Depends(get_current_profile),
+    repo: Repository = Depends(get_repository),
+):
+    """"Make your own graph": run user- or AI-written pandas/plotly code
+    against a private dataframe, sandboxed (see app/sandbox.py) -- never
+    executed directly in this process's own interpreter.
+    """
+    conversation = await repo.get_conversation(profile.id, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if not body.code and not body.prompt:
+        raise HTTPException(status_code=422, detail="Provide either `code` or `prompt`.")
+
+    portfolio = await get_portfolio_report(repo, conversation_id)
+    rows = portfolio_dataframe(portfolio) if "message" not in portfolio else []
+    if not rows:
+        raise HTTPException(status_code=422, detail="No portfolio data available to chart yet.")
+    columns = list(rows[0].keys())
+
+    code = body.code or await generate_chart_code(body.prompt, columns)
+
+    try:
+        validate_code(code)
+        chart = await run_sandboxed_async(code, {"df": rows})
+    except SandboxError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return CustomChartResult(dataframe=body.dataframe, code=code, chart=chart)
 
 
 @conversations_router.post("/{conversation_id}/visualizations", response_model=VisualizationResult)
