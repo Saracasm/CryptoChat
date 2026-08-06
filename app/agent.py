@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass
 from uuid import UUID
 import httpx
+import pandas as pd
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.mcp import MCPToolset
@@ -121,6 +122,128 @@ async def generate_chart_code(prompt: str, columns: list[str]) -> str:
         if code.startswith("python"):
             code = code[len("python"):]
     return code.strip()
+
+
+dataframe_summarizer_agent = Agent(
+    model,
+    deps_type=Deps,
+    instructions=(
+        "You summarize tabular query results for a crypto portfolio app. "
+        "You are given precomputed facts about a pandas DataFrame (row "
+        "count, column stats, min/max rows, outliers, and a small sample) "
+        "-- never the full data. Base your summary ONLY on the facts given "
+        "to you; never invent numbers, rows, or trends that aren't in the "
+        "facts. If the facts don't support a claim, say the data doesn't "
+        "show it rather than guessing. Never call any tools. Write a short, "
+        "plain-English explanation covering: how many rows, the important "
+        "totals/averages, the largest and smallest values, and any notable "
+        "trend or suspicious/outlier entries. Keep it to a few sentences."
+    ),
+)
+
+# Rows at or under this size are small enough to hand back verbatim; above
+# it we summarize instead of dumping potentially hundreds of rows into the
+# model's context.
+DATAFRAME_SUMMARY_ROW_THRESHOLD = 50
+# Per numeric column, cap how many outlier values get surfaced.
+MAX_OUTLIERS_PER_COLUMN = 5
+SAMPLE_ROW_COUNT = 5
+
+
+def _coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """SQL NUMERIC/DECIMAL columns come back from asyncpg as Python
+    Decimal objects, which pandas stores as generic 'object' dtype --
+    select_dtypes(include="number") then silently misses them entirely,
+    so cost/price/amount columns (the ones we most want stats on) would
+    never get analyzed. Convert any object column that's actually numeric
+    (Decimals, numeric strings) to float; leave true text columns alone.
+    """
+    df = df.copy()
+    for col in df.columns:
+        if df[col].dtype == object:
+            converted = pd.to_numeric(df[col], errors="coerce")
+            # Only adopt the conversion if every non-null value converted
+            # cleanly -- otherwise this is a genuine text column and
+            # coercing it would just turn it into all-NaN noise.
+            if converted.notna().equals(df[col].notna()):
+                df[col] = converted
+    return df
+
+
+def _dataframe_facts(df: pd.DataFrame) -> dict:
+    """Compute grounded, non-hallucinatable facts about a DataFrame:
+    per-column numeric stats, the rows holding each column's min/max, and
+    IQR-based outliers. These facts -- not the raw rows -- are what get
+    handed to the summarizer LLM, so it has nothing to invent from.
+    """
+    df = _coerce_numeric_columns(df)
+    numeric_cols = list(df.select_dtypes(include="number").columns)
+
+    metrics: dict[str, dict] = {}
+    outliers: dict[str, list] = {}
+    for col in numeric_cols:
+        series = df[col].dropna()
+        if series.empty:
+            continue
+        col_stats = {
+            "sum": round(float(series.sum()), 6),
+            "mean": round(float(series.mean()), 6),
+            "min": round(float(series.min()), 6),
+            "max": round(float(series.max()), 6),
+        }
+        max_idx = series.idxmax()
+        min_idx = series.idxmin()
+        col_stats["row_with_max"] = df.loc[max_idx].to_dict()
+        col_stats["row_with_min"] = df.loc[min_idx].to_dict()
+        metrics[col] = col_stats
+
+        q1, q3 = series.quantile(0.25), series.quantile(0.75)
+        iqr = q3 - q1
+        if iqr > 0:
+            lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+            mask = (series < lower) | (series > upper)
+            outlier_idx = series[mask].index[:MAX_OUTLIERS_PER_COLUMN]
+            if len(outlier_idx):
+                outliers[col] = [df.loc[i].to_dict() for i in outlier_idx]
+
+    return {
+        "row_count": len(df),
+        "columns": list(df.columns),
+        "numeric_metrics": metrics,
+        "outliers": outliers,
+        "sample": df.head(SAMPLE_ROW_COUNT).to_dict(orient="records"),
+    }
+
+
+async def summarize_dataframe(rows: list[dict], task: str) -> dict:
+    """Turn a large query result into grounded metrics plus a short,
+    fact-checked natural-language explanation, instead of returning every
+    row. Used by write_sql_query once a result exceeds
+    DATAFRAME_SUMMARY_ROW_THRESHOLD rows.
+    """
+    df = pd.DataFrame(rows)
+    facts = _dataframe_facts(df)
+
+    prompt = (
+        f"The user asked: {task}\n\n"
+        f"Here are the computed facts about the {facts['row_count']}-row "
+        f"result (columns: {', '.join(facts['columns'])}):\n\n"
+        f"Numeric metrics (sum/mean/min/max plus the full row where the "
+        f"min/max occurred): {facts['numeric_metrics']}\n\n"
+        f"Outlier rows per numeric column (values outside 1.5x IQR of the "
+        f"rest): {facts['outliers'] or 'none detected'}\n\n"
+        f"A sample of the first {SAMPLE_ROW_COUNT} rows: {facts['sample']}\n\n"
+        "Write the summary now, using only these facts."
+    )
+    result = await dataframe_summarizer_agent.run(prompt, deps=Deps(repo=None, conversation_id=None))
+    return {
+        "row_count": facts["row_count"],
+        "columns": facts["columns"],
+        "metrics": facts["numeric_metrics"],
+        "outliers": facts["outliers"],
+        "sample": facts["sample"],
+        "explanation": result.output.strip(),
+    }
 
 
 CONTEXT_WINDOW = 6
@@ -583,7 +706,20 @@ async def write_sql_query(ctx: RunContext[Deps], task: str) -> str:
 
     if not rows:
         return f"Query used:\n{sql_query}\n\nResult: the query ran successfully but returned no rows."
-    return f"Query used:\n{sql_query}\n\nResult: {rows}"
+
+    if len(rows) <= DATAFRAME_SUMMARY_ROW_THRESHOLD:
+        return f"Query used:\n{sql_query}\n\nResult: {rows}"
+
+    summary = await summarize_dataframe(rows, task)
+    return (
+        f"Query used:\n{sql_query}\n\n"
+        f"Result: {summary['row_count']} rows returned -- too many to list "
+        f"in full, so here is a summary.\n\n"
+        f"Metrics: {summary['metrics']}\n\n"
+        f"Outliers: {summary['outliers'] or 'none detected'}\n\n"
+        f"Sample rows: {summary['sample']}\n\n"
+        f"Explanation: {summary['explanation']}"
+    )
 
 
 # Cap on how much retrieved document text gets injected per turn (roughly
