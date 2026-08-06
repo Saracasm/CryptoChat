@@ -410,6 +410,8 @@ export default function ChatInterface() {
       ...current,
       { id: `${Date.now()}`, title: "Custom graph", chart: customChartResult.chart },
     ]);
+    setDashboardCollapsed(false);
+    setCustomChartOpen(false);
   }
 
   async function loadConversationList(pid: string) {
@@ -482,12 +484,10 @@ export default function ChatInterface() {
     setup();
   }, []);
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!draft.trim() || !profileId || !conversationId || sending) return;
+  async function sendMessage(text: string) {
+    if (!text.trim() || !profileId || !conversationId || sending) return;
 
-    setMessages((current) => [...current, { role: "user", content: draft }]);
-    const text = draft;
+    setMessages((current) => [...current, { role: "user", content: text }]);
     setDraft("");
     setSending(true);
 
@@ -509,6 +509,18 @@ export default function ChatInterface() {
     await loadConversationList(profileId);
     await loadPortfolio();
   }
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await sendMessage(draft);
+  }
+
+  const QUICK_COMMANDS = [
+    "Show my allocation",
+    "Explain today's BTC move",
+    "Rebalance suggestions",
+    "Compare ETH vs SOL",
+  ];
 
   function handleNewChat() {
     if (profileId) startConversation(profileId);
@@ -642,8 +654,14 @@ export default function ChatInterface() {
                 Get analysis, compare assets, upload a statement, or log a purchase.
               </p>
               <div className="mt-6 flex flex-wrap justify-center gap-2">
-                {["Explain today’s BTC move", "Rebalance suggestions", "Compare ETH vs SOL"].map((prompt) => (
-                  <Button key={prompt} variant="outline" size="sm" onClick={() => setDraft(prompt)}>
+                {QUICK_COMMANDS.map((prompt) => (
+                  <Button
+                    key={prompt}
+                    variant="outline"
+                    size="sm"
+                    disabled={sending}
+                    onClick={() => sendMessage(prompt)}
+                  >
                     {prompt}
                   </Button>
                 ))}
@@ -671,6 +689,23 @@ export default function ChatInterface() {
             </div>
           )}
         </Card>
+
+        {messages.length > 0 && (
+          <div className="flex shrink-0 flex-wrap gap-2">
+            {QUICK_COMMANDS.map((prompt) => (
+              <Button
+                key={prompt}
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={sending}
+                onClick={() => sendMessage(prompt)}
+              >
+                {prompt}
+              </Button>
+            ))}
+          </div>
+        )}
 
         <form className="flex shrink-0 gap-3" onSubmit={handleSubmit}>
           <input
@@ -731,7 +766,7 @@ export default function ChatInterface() {
               </Button>
             </div>
           ) : (
-            <div className="flex min-h-0 flex-1 flex-col">
+            <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
               <section className="border-b p-5">
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2">
