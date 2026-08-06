@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
 import httpx
+import logfire
 import pandas as pd
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
@@ -834,14 +835,19 @@ async def search_uploaded_documents(
     if ctx.deps.user_id is None:
         return {"error": "No active profile to search documents for."}
     top_k = max(1, min(top_k, 10))
-    try:
-        query_vector = await embed_query(query)
-        results = await ctx.deps.repo.search_document_chunks(
-            ctx.deps.user_id, query_vector, top_k=top_k
-        )
-    except Exception as exc:
-        logger.warning("search_uploaded_documents failed: %s", exc)
-        return {"error": "Document search is temporarily unavailable."}
+    with logfire.span(
+        "rag_retrieval", source="tool_call", query=query, top_k=top_k
+    ) as span:
+        try:
+            query_vector = await embed_query(query)
+            results = await ctx.deps.repo.search_document_chunks(
+                ctx.deps.user_id, query_vector, top_k=top_k
+            )
+        except Exception as exc:
+            logger.warning("search_uploaded_documents failed: %s", exc)
+            span.set_attribute("error", str(exc))
+            return {"error": "Document search is temporarily unavailable."}
+        span.set_attribute("chunks_returned", len(results))
     if not results:
         return {"message": "No uploaded documents matched this query."}
     return {"results": results}
@@ -904,16 +910,24 @@ async def _build_document_context(
     """
     if repo is None or user_id is None or not query.strip():
         return None
-    try:
-        query_vector = await embed_query(query)
-        chunks = await repo.search_document_chunks(
-            user_id, query_vector, top_k=DOCUMENT_CONTEXT_TOP_K
-        )
-    except Exception as exc:
-        logger.warning("Auto document retrieval failed: %s", exc)
-        return None
-    if not chunks:
-        return None
+    with logfire.span(
+        "rag_retrieval",
+        source="auto_context",
+        query=query,
+        top_k=DOCUMENT_CONTEXT_TOP_K,
+    ) as span:
+        try:
+            query_vector = await embed_query(query)
+            chunks = await repo.search_document_chunks(
+                user_id, query_vector, top_k=DOCUMENT_CONTEXT_TOP_K
+            )
+        except Exception as exc:
+            logger.warning("Auto document retrieval failed: %s", exc)
+            span.set_attribute("error", str(exc))
+            return None
+        span.set_attribute("chunks_returned", len(chunks))
+        if not chunks:
+            return None
 
     pieces = []
     remaining = DOCUMENT_CONTEXT_CHAR_BUDGET
