@@ -285,11 +285,7 @@ dataframe_summarizer_agent = Agent(
     ),
 )
 
-# Rows at or under this size are small enough to hand back verbatim; above
-# it we summarize instead of dumping potentially hundreds of rows into the
-# model's context.
 DATAFRAME_SUMMARY_ROW_THRESHOLD = 50
-# Per numeric column, cap how many outlier values get surfaced.
 MAX_OUTLIERS_PER_COLUMN = 5
 SAMPLE_ROW_COUNT = 5
 
