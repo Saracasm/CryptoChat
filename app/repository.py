@@ -3,6 +3,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Conversation, Document, DocumentEmbedding, Holding, Message, Profile
 from sqlalchemy import text
+from passlib.context import CryptContext
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 class Repository:
     """All database reads and writes live here, behind simple method calls."""
@@ -256,3 +259,17 @@ class Repository:
         result = await self._session.execute(text(cleaned))
         rows = result.mappings().all()
         return [dict(row) for row in rows]
+
+
+    async def create_profile_with_password(self, username: str, password: str) -> Profile:
+        profile = Profile(
+            username=username,
+            password_hash=pwd_context.hash(password),
+        )
+        self._session.add(profile)
+        await self._session.flush()
+        return profile
+
+    async def get_profile_by_username(self, username: str) -> Profile | None:
+        stmt = select(Profile).where(Profile.username == username)
+        return await self._session.scalar(stmt)

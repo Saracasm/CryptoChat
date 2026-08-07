@@ -1,6 +1,7 @@
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from fastapi.security import OAuth2PasswordRequestForm
 import httpx
 
 from app.agent import (
@@ -14,7 +15,7 @@ from app.agent import (
 from app.dependencies import get_current_profile, get_repository
 from app.ingest import ingest_document
 from app.models import Profile
-from app.repository import Repository
+from app.repository import Repository, pwd_context
 from app.sandbox import SandboxError, run_sandboxed_async, validate_code
 from app.schemas import (
     ConversationRead,
@@ -30,6 +31,8 @@ from app.schemas import (
     ProfileRead,
     VisualizationCreate,
 )
+from app.security import create_access_token
+from app.config import settings
 from app.visualization import (
     PortfolioVisualizationResult,
     VisualizationResult,
@@ -47,6 +50,33 @@ async def create_profile(
     repo: Repository = Depends(get_repository),
 ):
     return await repo.create_profile(name=body.name)
+
+
+@profiles_router.post("/signup")
+async def signup(
+    username: str,
+    password: str,
+    repo: Repository = Depends(get_repository),
+):
+    existing = await repo.get_profile_by_username(username)
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already taken")
+    profile = await repo.create_profile_with_password(username=username, password=password)
+    return {"id": profile.id, "username": profile.username}
+
+
+@profiles_router.post("/login")
+async def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    repo: Repository = Depends(get_repository),
+):
+    profile = await repo.get_profile_by_username(form_data.username)
+    if not profile or not pwd_context.verify(form_data.password, profile.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_access_token(
+        user_id=profile.id, username=profile.username, secret=settings.jwt_secret
+    )
+    return {"access_token": token, "token_type": "bearer"}
 
 
 conversations_router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -120,20 +150,15 @@ async def send_message(
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # 1. Save the user's new message.
     await repo.add_message(conversation_id, "user", body.content)
 
-    # 2. Load the full transcript (prior context) and shape it for the agent.
     history = await repo.get_history(conversation_id)
     llm_messages = [{"role": m.role, "content": m.content} for m in history]
 
-    # 3. Run the agent -- it may call tools (log_holding, get_prices, get_portfolio).
     reply_text = await get_reply(repo, conversation_id, llm_messages, user_id=profile.id)
-    
-    # 4. Save the assistant's reply.
+
     reply = await repo.add_message(conversation_id, "assistant", reply_text)
 
-    # 5. Auto-title
     full_messages = llm_messages + [{"role": "assistant", "content": reply_text}]
     total_messages = len(full_messages)
     if conversation.title is None:

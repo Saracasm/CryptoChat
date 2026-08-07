@@ -113,9 +113,15 @@ const currency = new Intl.NumberFormat("en-US", {
 });
 
 export default function ChatInterface() {
+  const [token, setToken] = useState<string | null>(null);
+  const [authMode, setAuthMode] = useState<"login" | "signup">("login");
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authLoading, setAuthLoading] = useState(false);
+
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
-  const [profileId, setProfileId] = useState<string | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [sending, setSending] = useState(false);
@@ -187,14 +193,85 @@ export default function ChatInterface() {
     };
   }, [resize, stopResizing]);
 
+  function authHeaders(extra: Record<string, string> = {}) {
+    return { Authorization: `Bearer ${token}`, ...extra };
+  }
+
+  async function loadConversationList(tok: string) {
+    const res = await fetch(`/api/conversations`, {
+      headers: { Authorization: `Bearer ${tok}` },
+    });
+    if (res.status === 401) {
+      handleLogout();
+      return;
+    }
+    const list = await res.json();
+    setConversations(Array.isArray(list) ? list : []);
+  }
+
+  async function startConversation(tok: string) {
+    const res = await fetch(`/api/conversations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}` },
+    });
+    const conversation = await res.json();
+    setConversationId(conversation.id);
+    setMessages([]);
+    await loadConversationList(tok);
+  }
+
+  async function openConversation(cid: string) {
+    if (!token) return;
+    const res = await fetch(`/api/conversations/${cid}/messages`, {
+      headers: authHeaders(),
+    });
+    const history = await res.json();
+    setConversationId(cid);
+    setMessages(Array.isArray(history) ? history : []);
+  }
+
+  // Bootstraps from a saved token, or waits for login.
+  useEffect(() => {
+    async function setup(tok: string) {
+      const res = await fetch(`/api/conversations`, {
+        headers: { Authorization: `Bearer ${tok}` },
+      });
+      if (res.status === 401) {
+        handleLogout();
+        return;
+      }
+      const list = await res.json();
+      const existing = Array.isArray(list) ? list : [];
+      setConversations(existing);
+
+      if (existing.length > 0) {
+        const cid = existing[0].id;
+        const msgRes = await fetch(`/api/conversations/${cid}/messages`, {
+          headers: { Authorization: `Bearer ${tok}` },
+        });
+        const history = await msgRes.json();
+        setConversationId(cid);
+        setMessages(Array.isArray(history) ? history : []);
+      } else {
+        await startConversation(tok);
+      }
+    }
+
+    const savedToken = localStorage.getItem("accessToken");
+    if (savedToken) {
+      setToken(savedToken);
+      setup(savedToken);
+    }
+  }, []);
+
   const loadMarketChart = useCallback(async () => {
-    if (!profileId || !conversationId) return;
+    if (!token || !conversationId) return;
     setChartLoading(true);
     setChartError(null);
     try {
       const response = await fetch(`/api/conversations/${conversationId}/visualizations`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Profile-Id": profileId },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({
           coin: selectedCoin,
           metric: selectedMetric,
@@ -210,19 +287,19 @@ export default function ChatInterface() {
     } finally {
       setChartLoading(false);
     }
-  }, [conversationId, profileId, selectedCoin, selectedDays, selectedMetric]);
+  }, [conversationId, token, selectedCoin, selectedDays, selectedMetric]);
 
   useEffect(() => {
-    if (!dashboardCollapsed) loadMarketChart();
-  }, [dashboardCollapsed, loadMarketChart]);
+    if (!dashboardCollapsed && token) loadMarketChart();
+  }, [dashboardCollapsed, loadMarketChart, token]);
 
   const loadPortfolio = useCallback(async () => {
-    if (!profileId || !conversationId) return;
+    if (!token || !conversationId) return;
     setPortfolioLoading(true);
     setPortfolioError(null);
     try {
       const response = await fetch(`/api/conversations/${conversationId}/portfolio`, {
-        headers: { "X-Profile-Id": profileId },
+        headers: authHeaders(),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail ?? "Unable to load portfolio.");
@@ -233,20 +310,20 @@ export default function ChatInterface() {
     } finally {
       setPortfolioLoading(false);
     }
-  }, [conversationId, profileId]);
+  }, [conversationId, token]);
 
   useEffect(() => {
-    if (!dashboardCollapsed) loadPortfolio();
-  }, [dashboardCollapsed, loadPortfolio]);
+    if (!dashboardCollapsed && token) loadPortfolio();
+  }, [dashboardCollapsed, loadPortfolio, token]);
 
   const loadPortfolioChart = useCallback(async () => {
-    if (!profileId || !conversationId) return;
+    if (!token || !conversationId) return;
     setPortfolioChartLoading(true);
     setPortfolioChartError(null);
     try {
       const response = await fetch(`/api/conversations/${conversationId}/portfolio-chart`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Profile-Id": profileId },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ chart_type: portfolioChartType }),
       });
       const data = await response.json();
@@ -258,11 +335,11 @@ export default function ChatInterface() {
     } finally {
       setPortfolioChartLoading(false);
     }
-  }, [conversationId, portfolioChartType, profileId]);
+  }, [conversationId, portfolioChartType, token]);
 
   useEffect(() => {
-    if (!dashboardCollapsed) loadPortfolioChart();
-  }, [dashboardCollapsed, loadPortfolioChart]);
+    if (!dashboardCollapsed && token) loadPortfolioChart();
+  }, [dashboardCollapsed, loadPortfolioChart, token]);
 
   function pinPortfolioChart() {
     if (!portfolioChart) return;
@@ -277,12 +354,12 @@ export default function ChatInterface() {
   }
 
   const loadDocuments = useCallback(async () => {
-    if (!profileId) return;
+    if (!token) return;
     setDocumentsLoading(true);
     setDocumentsError(null);
     try {
       const response = await fetch(`/api/documents`, {
-        headers: { "X-Profile-Id": profileId },
+        headers: authHeaders(),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail ?? "Unable to load documents.");
@@ -293,16 +370,16 @@ export default function ChatInterface() {
     } finally {
       setDocumentsLoading(false);
     }
-  }, [profileId]);
+  }, [token]);
 
   useEffect(() => {
-    if (!dashboardCollapsed) loadDocuments();
-  }, [dashboardCollapsed, loadDocuments]);
+    if (!dashboardCollapsed && token) loadDocuments();
+  }, [dashboardCollapsed, loadDocuments, token]);
 
   async function handleFileSelected(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     event.target.value = ""; // reset so re-selecting the same file re-triggers onChange
-    if (!file || !profileId) return;
+    if (!file || !token) return;
 
     setUploading(true);
     setUploadError(null);
@@ -312,7 +389,7 @@ export default function ChatInterface() {
       formData.append("file", file);
       const response = await fetch(`/api/documents`, {
         method: "POST",
-        headers: { "X-Profile-Id": profileId },
+        headers: authHeaders(),
         body: formData,
       });
       const data = await response.json();
@@ -330,12 +407,12 @@ export default function ChatInterface() {
 
   async function openCustomChartModal() {
     setCustomChartOpen(true);
-    if (dataframeInfo || !profileId || !conversationId) return;
+    if (dataframeInfo || !token || !conversationId) return;
     setDataframeLoading(true);
     setDataframeError(null);
     try {
       const response = await fetch(`/api/conversations/${conversationId}/dataframes`, {
-        headers: { "X-Profile-Id": profileId },
+        headers: authHeaders(),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail ?? "Unable to load available data.");
@@ -362,13 +439,13 @@ export default function ChatInterface() {
   }
 
   async function runCustomChart(code: string) {
-    if (!profileId || !conversationId || !code.trim()) return;
+    if (!token || !conversationId || !code.trim()) return;
     setCustomChartRunning(true);
     setCustomChartError(null);
     try {
       const response = await fetch(`/api/conversations/${conversationId}/custom-chart`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Profile-Id": profileId },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ code }),
       });
       const data = await response.json();
@@ -384,13 +461,13 @@ export default function ChatInterface() {
   }
 
   async function generateChartWithAI() {
-    if (!profileId || !conversationId || !customChartPrompt.trim()) return;
+    if (!token || !conversationId || !customChartPrompt.trim()) return;
     setCustomChartGenerating(true);
     setCustomChartError(null);
     try {
       const response = await fetch(`/api/conversations/${conversationId}/custom-chart`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Profile-Id": profileId },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ prompt: customChartPrompt }),
       });
       const data = await response.json();
@@ -416,78 +493,57 @@ export default function ChatInterface() {
     setCustomChartOpen(false);
   }
 
-  async function loadConversationList(pid: string) {
-    const res = await fetch(`/api/conversations`, {
-      headers: { "X-Profile-Id": pid },
-    });
-    const list = await res.json();
-    setConversations(Array.isArray(list) ? list : []);
-  }
+  async function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setAuthError(null);
+    setAuthLoading(true);
 
-  async function startConversation(pid: string) {
-    const res = await fetch(`/api/conversations`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Profile-Id": pid },
-    });
-    const conversation = await res.json();
-    setConversationId(conversation.id);
-    setMessages([]);
-    await loadConversationList(pid);
-  }
-
-  async function openConversation(cid: string) {
-    if (!profileId) return;
-    const res = await fetch(`/api/conversations/${cid}/messages`, {
-      headers: { "X-Profile-Id": profileId },
-    });
-    const history = await res.json();
-    setConversationId(cid);
-    setMessages(Array.isArray(history) ? history : []);
-  }
-
-  useEffect(() => {
-    async function setup() {
-      const savedProfile = localStorage.getItem("profileId");
-
-      if (savedProfile) {
-        setProfileId(savedProfile);
-        const res = await fetch(`/api/conversations`, {
-          headers: { "X-Profile-Id": savedProfile },
-        });
-        const list = await res.json();
-        const existing = Array.isArray(list) ? list : [];
-        setConversations(existing);
-
-        if (existing.length > 0) {
-          const cid = existing[0].id;
-          const msgRes = await fetch(`/api/conversations/${cid}/messages`, {
-            headers: { "X-Profile-Id": savedProfile },
-          });
-          const history = await msgRes.json();
-          setConversationId(cid);
-          setMessages(Array.isArray(history) ? history : []);
-        } else {
-          await startConversation(savedProfile);
+    try {
+      if (authMode === "signup") {
+        const signupRes = await fetch(
+          `/api/profiles/signup?username=${encodeURIComponent(authUsername)}&password=${encodeURIComponent(authPassword)}`,
+          { method: "POST" }
+        );
+        if (!signupRes.ok) {
+          const err = await signupRes.json();
+          throw new Error(err.detail ?? "Signup failed");
         }
-        return;
       }
 
-      // First visit: create a profile and remember it.
-      const profileRes = await fetch(`/api/profiles`, {
+      const loginBody = new URLSearchParams();
+      loginBody.set("username", authUsername);
+      loginBody.set("password", authPassword);
+
+      const loginRes = await fetch(`/api/profiles/login`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: "Demo User" }),
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: loginBody.toString(),
       });
-      const profile = await profileRes.json();
-      localStorage.setItem("profileId", profile.id);
-      setProfileId(profile.id);
-      await startConversation(profile.id);
+      if (!loginRes.ok) {
+        const err = await loginRes.json();
+        throw new Error(err.detail ?? "Login failed");
+      }
+      const data = await loginRes.json();
+      localStorage.setItem("accessToken", data.access_token);
+      setToken(data.access_token);
+      await startConversation(data.access_token);
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : "Something went wrong");
+    } finally {
+      setAuthLoading(false);
     }
-    setup();
-  }, []);
+  }
+
+  function handleLogout() {
+    localStorage.removeItem("accessToken");
+    setToken(null);
+    setConversations([]);
+    setMessages([]);
+    setConversationId(null);
+  }
 
   async function sendMessage(text: string) {
-    if (!text.trim() || !profileId || !conversationId || sending) return;
+    if (!text.trim() || !token || !conversationId || sending) return;
 
     setMessages((current) => [...current, { role: "user", content: text }]);
     setDraft("");
@@ -497,7 +553,7 @@ export default function ChatInterface() {
       `/api/conversations/${conversationId}/messages`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Profile-Id": profileId },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ content: text }),
       }
     );
@@ -508,7 +564,7 @@ export default function ChatInterface() {
       { role: reply.role, content: reply.content },
     ]);
     setSending(false);
-    await loadConversationList(profileId);
+    await loadConversationList(token);
     await loadPortfolio();
   }
 
@@ -525,14 +581,14 @@ export default function ChatInterface() {
   ];
 
   function handleNewChat() {
-    if (profileId) startConversation(profileId);
+    if (token) startConversation(token);
   }
 
   async function confirmDelete(cid: string) {
-    if (!profileId) return;
+    if (!token) return;
     await fetch(`/api/conversations/${cid}`, {
       method: "DELETE",
-      headers: { "X-Profile-Id": profileId },
+      headers: authHeaders(),
     });
     setPendingDeleteId(null);
 
@@ -543,9 +599,57 @@ export default function ChatInterface() {
       if (remaining.length > 0) {
         await openConversation(remaining[0].id);
       } else {
-        await startConversation(profileId);
+        await startConversation(token);
       }
     }
+  }
+
+  // --- Login/signup screen ---
+  if (!token) {
+    return (
+      <div className="flex h-screen items-center justify-center">
+        <Card className="w-full max-w-sm space-y-4 p-6">
+          <h1 className="text-xl font-semibold">
+            {authMode === "login" ? "Log in" : "Sign up"}
+          </h1>
+          <form className="space-y-3" onSubmit={handleAuthSubmit}>
+            <Input
+              value={authUsername}
+              onChange={(e) => setAuthUsername(e.target.value)}
+              placeholder="Username"
+              disabled={authLoading}
+            />
+            <Input
+              type="password"
+              value={authPassword}
+              onChange={(e) => setAuthPassword(e.target.value)}
+              placeholder="Password"
+              disabled={authLoading}
+            />
+            {authError && (
+              <p className="text-sm text-destructive">{authError}</p>
+            )}
+            <Button type="submit" className="w-full" disabled={authLoading}>
+              {authLoading
+                ? "Please wait..."
+                : authMode === "login"
+                  ? "Log in"
+                  : "Sign up"}
+            </Button>
+          </form>
+          <button
+            className="text-sm text-muted-foreground underline"
+            onClick={() =>
+              setAuthMode(authMode === "login" ? "signup" : "login")
+            }
+          >
+            {authMode === "login"
+              ? "Need an account? Sign up"
+              : "Already have an account? Log in"}
+          </button>
+        </Card>
+      </div>
+    );
   }
 
   const portfolioTotal = portfolio?._total as PortfolioTotal | undefined;
@@ -627,6 +731,9 @@ export default function ChatInterface() {
             )
           )}
         </div>
+        <Button variant="ghost" className="mt-auto w-full" onClick={handleLogout}>
+          Log out
+        </Button>
       </aside>
 
       <div
@@ -722,7 +829,7 @@ export default function ChatInterface() {
             variant="outline"
             size="icon"
             aria-label="Upload a file"
-            disabled={uploading || !profileId}
+            disabled={uploading || !token}
             onClick={() => fileInputRef.current?.click()}
           >
             <Upload />
@@ -750,7 +857,7 @@ export default function ChatInterface() {
         )}
       </main>
 
-      {/* Dashboard: chart and portfolio data will be connected next. */}
+      {/* Dashboard: charts and portfolio data */}
       <div className="hidden shrink-0 xl:flex">
         <div
           onMouseDown={startDashboardResizing}
@@ -837,7 +944,7 @@ export default function ChatInterface() {
                 <Button
                   variant="outline"
                   className="mt-4 w-full"
-                  disabled={!profileId || !conversationId}
+                  disabled={!token || !conversationId}
                   onClick={openCustomChartModal}
                 >
                   Make your own graph
@@ -853,7 +960,7 @@ export default function ChatInterface() {
                   <Button
                     variant="outline"
                     size="sm"
-                    disabled={uploading || !profileId}
+                    disabled={uploading || !token}
                     onClick={() => fileInputRef.current?.click()}
                   >
                     {uploading ? "Uploading…" : "Upload"}
