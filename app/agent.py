@@ -18,7 +18,6 @@ model = OpenRouterModel(
     provider=OpenRouterProvider(api_key=settings.openrouter_api_key),
 )
 
-
 crypto_mcp_tools = MCPToolset("http://localhost:8001/mcp")
 
 

@@ -14,7 +14,8 @@ class Profile(Base):
     id: Mapped[UUID] = mapped_column(
         PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
-    name: Mapped[str] = mapped_column(String)
+    username: Mapped[str] = mapped_column(String, unique=True)
+    password_hash: Mapped[str] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
@@ -22,7 +23,6 @@ class Profile(Base):
     conversations: Mapped[list["Conversation"]] = relationship(
         back_populates="profile", cascade="all, delete-orphan"
     )
-
 
 class Conversation(Base):
     __tablename__ = "conversations"

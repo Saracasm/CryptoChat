@@ -6,7 +6,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import SessionLocal
 from app.models import Profile
 from app.repository import Repository
+from app.config import settings
+from app.security import require_current_user
 
+async def require_api_key(x_api_key: str = Header(...)) -> None:
+    if x_api_key != settings.api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 async def get_session() -> AsyncSession:
     """One database session per request = one unit of work.
@@ -30,11 +35,11 @@ def get_repository(
 
 
 async def get_current_profile(
-    x_profile_id: UUID = Header(...),
+    user_id: UUID = Depends(require_current_user(settings.jwt_secret)),
     repo: Repository = Depends(get_repository),
 ) -> Profile:
-    """Resolve the acting profile from the X-Profile-Id header, or 404."""
-    profile = await repo.get_profile(x_profile_id)
+    """Resolve the acting profile from the JWT bearer token, or 404."""
+    profile = await repo.get_profile(user_id)
     if profile is None:
         raise HTTPException(status_code=404, detail="Profile not found")
     return profile

@@ -1,6 +1,10 @@
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
+from app.repository import pwd_context
+from app.security import create_access_token 
+from app.config import settings
+from fastapi.security import OAuth2PasswordRequestForm
 
 from app.agent import CONTEXT_WINDOW, get_reply, summarize_title
 from app.dependencies import get_current_profile, get_repository
@@ -23,6 +27,32 @@ async def create_profile(
     repo: Repository = Depends(get_repository),
 ):
     return await repo.create_profile(name=body.name)
+
+@profiles_router.post("/signup")
+async def signup(
+    username: str,
+    password: str,
+    repo: Repository = Depends(get_repository),
+):
+    existing = await repo.get_profile_by_username(username)
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already taken")
+    profile = await repo.create_profile_with_password(username=username, password=password)
+    return {"id": profile.id, "username": profile.username}
+
+@profiles_router.post("/login")
+async def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    repo: Repository = Depends(get_repository),
+):
+    profile = await repo.get_profile_by_username(form_data.username)
+    if not profile or not pwd_context.verify(form_data.password, profile.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_access_token(
+        user_id=profile.id, username=profile.username, secret=settings.jwt_secret
+    )
+    return {"access_token": token, "token_type": "bearer"}
+
 
 
 conversations_router = APIRouter(prefix="/conversations", tags=["conversations"])

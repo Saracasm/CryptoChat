@@ -21,9 +21,15 @@ type Conversation = {
 };
 
 export default function ChatInterface() {
+  const [token, setToken] = useState<string | null>(null);
+  const [authMode, setAuthMode] = useState<"login" | "signup">("login");
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authLoading, setAuthLoading] = useState(false);
+
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
-  const [profileId, setProfileId] = useState<string | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [sending, setSending] = useState(false);
@@ -54,79 +60,129 @@ export default function ChatInterface() {
     };
   }, [resize, stopResizing]);
 
-  async function loadConversationList(pid: string) {
+  function authHeaders(extra: Record<string, string> = {}) {
+    return { Authorization: `Bearer ${token}`, ...extra };
+  }
+
+  async function loadConversationList(tok: string) {
     const res = await fetch(`/api/conversations`, {
-      headers: { "X-Profile-Id": pid },
+      headers: { Authorization: `Bearer ${tok}` },
     });
+    if (res.status === 401) {
+      handleLogout();
+      return;
+    }
     const list = await res.json();
     setConversations(Array.isArray(list) ? list : []);
   }
 
-  async function startConversation(pid: string) {
+  async function startConversation(tok: string) {
     const res = await fetch(`/api/conversations`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Profile-Id": pid },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}` },
     });
     const conversation = await res.json();
     setConversationId(conversation.id);
     setMessages([]);
-    await loadConversationList(pid);
+    await loadConversationList(tok);
   }
 
   async function openConversation(cid: string) {
-    if (!profileId) return;
+    if (!token) return;
     const res = await fetch(`/api/conversations/${cid}/messages`, {
-      headers: { "X-Profile-Id": profileId },
+      headers: authHeaders(),
     });
     const history = await res.json();
     setConversationId(cid);
     setMessages(Array.isArray(history) ? history : []);
   }
 
+  // Bootstraps from a saved token, or waits for login.
   useEffect(() => {
-    async function setup() {
-      const savedProfile = localStorage.getItem("profileId");
-
-      if (savedProfile) {
-        setProfileId(savedProfile);
-        const res = await fetch(`/api/conversations`, {
-          headers: { "X-Profile-Id": savedProfile },
-        });
-        const list = await res.json();
-        const existing = Array.isArray(list) ? list : [];
-        setConversations(existing);
-
-        if (existing.length > 0) {
-          const cid = existing[0].id;
-          const msgRes = await fetch(`/api/conversations/${cid}/messages`, {
-            headers: { "X-Profile-Id": savedProfile },
-          });
-          const history = await msgRes.json();
-          setConversationId(cid);
-          setMessages(Array.isArray(history) ? history : []);
-        } else {
-          await startConversation(savedProfile);
-        }
+    async function setup(tok: string) {
+      const res = await fetch(`/api/conversations`, {
+        headers: { Authorization: `Bearer ${tok}` },
+      });
+      if (res.status === 401) {
+        handleLogout();
         return;
       }
+      const list = await res.json();
+      const existing = Array.isArray(list) ? list : [];
+      setConversations(existing);
 
-      // First visit: create a profile and remember it.
-      const profileRes = await fetch(`/api/profiles`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: "Demo User" }),
-      });
-      const profile = await profileRes.json();
-      localStorage.setItem("profileId", profile.id);
-      setProfileId(profile.id);
-      await startConversation(profile.id);
+      if (existing.length > 0) {
+        const cid = existing[0].id;
+        const msgRes = await fetch(`/api/conversations/${cid}/messages`, {
+          headers: { Authorization: `Bearer ${tok}` },
+        });
+        const history = await msgRes.json();
+        setConversationId(cid);
+        setMessages(Array.isArray(history) ? history : []);
+      } else {
+        await startConversation(tok);
+      }
     }
-    setup();
+
+    const savedToken = localStorage.getItem("accessToken");
+    if (savedToken) {
+      setToken(savedToken);
+      setup(savedToken);
+    }
   }, []);
+
+  async function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setAuthError(null);
+    setAuthLoading(true);
+
+    try {
+      if (authMode === "signup") {
+        const signupRes = await fetch(
+          `/api/profiles/signup?username=${encodeURIComponent(authUsername)}&password=${encodeURIComponent(authPassword)}`,
+          { method: "POST" }
+        );
+        if (!signupRes.ok) {
+          const err = await signupRes.json();
+          throw new Error(err.detail ?? "Signup failed");
+        }
+      }
+
+      const loginBody = new URLSearchParams();
+      loginBody.set("username", authUsername);
+      loginBody.set("password", authPassword);
+
+      const loginRes = await fetch(`/api/profiles/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: loginBody.toString(),
+      });
+      if (!loginRes.ok) {
+        const err = await loginRes.json();
+        throw new Error(err.detail ?? "Login failed");
+      }
+      const data = await loginRes.json();
+      localStorage.setItem("accessToken", data.access_token);
+      setToken(data.access_token);
+      await startConversation(data.access_token);
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : "Something went wrong");
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  function handleLogout() {
+    localStorage.removeItem("accessToken");
+    setToken(null);
+    setConversations([]);
+    setMessages([]);
+    setConversationId(null);
+  }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!draft.trim() || !profileId || !conversationId || sending) return;
+    if (!draft.trim() || !token || !conversationId || sending) return;
 
     setMessages((current) => [...current, { role: "user", content: draft }]);
     const text = draft;
@@ -137,7 +193,7 @@ export default function ChatInterface() {
       `/api/conversations/${conversationId}/messages`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Profile-Id": profileId },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ content: text }),
       }
     );
@@ -148,18 +204,18 @@ export default function ChatInterface() {
       { role: reply.role, content: reply.content },
     ]);
     setSending(false);
-    await loadConversationList(profileId);
+    await loadConversationList(token);
   }
 
   function handleNewChat() {
-    if (profileId) startConversation(profileId);
+    if (token) startConversation(token);
   }
 
   async function confirmDelete(cid: string) {
-    if (!profileId) return;
+    if (!token) return;
     await fetch(`/api/conversations/${cid}`, {
       method: "DELETE",
-      headers: { "X-Profile-Id": profileId },
+      headers: authHeaders(),
     });
     setPendingDeleteId(null);
 
@@ -170,14 +226,62 @@ export default function ChatInterface() {
       if (remaining.length > 0) {
         await openConversation(remaining[0].id);
       } else {
-        await startConversation(profileId);
+        await startConversation(token);
       }
     }
   }
 
+  // --- Login/signup screen ---
+  if (!token) {
+    return (
+      <div className="flex h-screen items-center justify-center">
+        <Card className="w-full max-w-sm space-y-4 p-6">
+          <h1 className="text-xl font-semibold">
+            {authMode === "login" ? "Log in" : "Sign up"}
+          </h1>
+          <form className="space-y-3" onSubmit={handleAuthSubmit}>
+            <Input
+              value={authUsername}
+              onChange={(e) => setAuthUsername(e.target.value)}
+              placeholder="Username"
+              disabled={authLoading}
+            />
+            <Input
+              type="password"
+              value={authPassword}
+              onChange={(e) => setAuthPassword(e.target.value)}
+              placeholder="Password"
+              disabled={authLoading}
+            />
+            {authError && (
+              <p className="text-sm text-destructive">{authError}</p>
+            )}
+            <Button type="submit" className="w-full" disabled={authLoading}>
+              {authLoading
+                ? "Please wait..."
+                : authMode === "login"
+                  ? "Log in"
+                  : "Sign up"}
+            </Button>
+          </form>
+          <button
+            className="text-sm text-muted-foreground underline"
+            onClick={() =>
+              setAuthMode(authMode === "login" ? "signup" : "login")
+            }
+          >
+            {authMode === "login"
+              ? "Need an account? Sign up"
+              : "Already have an account? Log in"}
+          </button>
+        </Card>
+      </div>
+    );
+  }
+
+  // --- Main chat UI (unchanged layout, just header swap done above) ---
   return (
     <div className="flex h-screen overflow-hidden">
-      {/* Sidebar: chat history */}
       <aside
         style={{ width: sidebarWidth }}
         className="flex shrink-0 flex-col border-r p-4 space-y-3 overflow-y-auto"
@@ -237,6 +341,9 @@ export default function ChatInterface() {
             )
           )}
         </div>
+        <Button variant="ghost" className="mt-auto w-full" onClick={handleLogout}>
+          Log out
+        </Button>
       </aside>
 
       <div
@@ -246,7 +353,7 @@ export default function ChatInterface() {
 
       <main className="mx-auto flex h-full w-full max-w-3xl flex-col gap-6 overflow-hidden px-6 py-12">
         <div className="flex shrink-0 items-center justify-between">
-          <h1 className="text-3xl font-semibold">Week 2 Demo - CryptoChat</h1>
+          <h1 className="text-3xl font-semibold">CryptoChat</h1>
           <ThemeToggle />
         </div>
 
