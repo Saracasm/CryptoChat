@@ -8,14 +8,14 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
-  const profileId = request.headers.get("X-Profile-Id") ?? "";
+  const authHeader = request.headers.get("Authorization") ?? "";
   const body = await request.json();
 
   const res = await fetch(`${FASTAPI_URL}/conversations/${id}/portfolio-chart`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Profile-Id": profileId,
+      Authorization: authHeader,
     },
     body: JSON.stringify(body),
   });

@@ -4,9 +4,9 @@ const FASTAPI_URL = process.env.FASTAPI_URL;
 
 // GET /api/documents -> list the acting profile's uploaded documents
 export async function GET(request: NextRequest) {
-  const profileId = request.headers.get("X-Profile-Id") ?? "";
+  const authHeader = request.headers.get("Authorization") ?? "";
   const res = await fetch(`${FASTAPI_URL}/documents`, {
-    headers: { "X-Profile-Id": profileId },
+    headers: { Authorization: authHeader },
   });
 
   const data = await res.json();
@@ -16,12 +16,12 @@ export async function GET(request: NextRequest) {
 // POST /api/documents -> upload + ingest one file into the acting profile's
 // private RAG corpus. The incoming multipart body is forwarded as-is.
 export async function POST(request: NextRequest) {
-  const profileId = request.headers.get("X-Profile-Id") ?? "";
+  const authHeader = request.headers.get("Authorization") ?? "";
   const formData = await request.formData();
 
   const res = await fetch(`${FASTAPI_URL}/documents/upload`, {
     method: "POST",
-    headers: { "X-Profile-Id": profileId },
+    headers: { Authorization: authHeader },
     body: formData,
   });
 

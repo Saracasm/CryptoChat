@@ -10,9 +10,9 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
-  const profileId = request.headers.get("X-Profile-Id") ?? "";
+  const authHeader = request.headers.get("Authorization") ?? "";
   const res = await fetch(`${FASTAPI_URL}/conversations/${id}/dataframes`, {
-    headers: { "X-Profile-Id": profileId },
+    headers: { Authorization: authHeader },
   });
 
   const data = await res.json();
