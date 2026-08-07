@@ -7,12 +7,19 @@ requires-python = ">=3.13"
 dependencies = [
     "asyncpg>=0.31.0",
     "bcrypt<4.1",
+    "chonkie>=1.7.0",
     "fastapi[standard]>=0.139.0",
+    "google-genai>=2.11.0",
     "httpx>=0.28.1",
-    "logfire[fastapi,system-metrics]>=4.37.0",
+    "logfire[asyncpg,fastapi,httpx,system-metrics]>=4.37.0",
+    "markitdown[docx,pdf]>=0.1.7",
     "mcp>=1.0.0",
     "openai>=2.45.0",
+    "pandas>=3.0.5",
     "passlib>=1.7.4",
+    "pgvector>=0.5.0",
+    "plotly>=6.9.0",
+    "psutil>=7.2.2",
     "pydantic>=2.13.4",
     "pydantic-ai>=2.10.0",
     "pydantic-settings>=2.14.2",
@@ -24,5 +31,15 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
     "ruff>=0.15.21",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+markers = [
+    "integration: hits a real external service (CoinGecko, Gemini) -- needs network + API keys",
 ]

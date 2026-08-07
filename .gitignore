@@ -9,3 +9,8 @@ wheels/
 # Virtual environments
 .venv/
 .env
+.claude
+
+# SSH keys -- never commit these
+*.pem
+*.key

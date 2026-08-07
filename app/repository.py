@@ -1,7 +1,7 @@
 from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.models import Conversation, Holding, Message, Profile
+from app.models import Conversation, Document, DocumentEmbedding, Holding, Message, Profile
 from sqlalchemy import text
 from passlib.context import CryptContext
 
@@ -164,6 +164,89 @@ class Repository:
         await self._session.delete(holding)
         await self._session.flush()
         return True
+
+    async def create_document(
+        self, profile_id: UUID, filename: str, content_type: str, raw_text: str
+    ) -> Document:
+        """Create the parent Document row for one uploaded file."""
+        document = Document(
+            profile_id=profile_id,
+            filename=filename,
+            content_type=content_type,
+            raw_text=raw_text,
+        )
+        self._session.add(document)
+        await self._session.flush()
+        return document
+
+    async def add_document_embeddings(
+        self,
+        document_id: UUID,
+        chunks: list[tuple[int, str, list[float], dict]],
+    ) -> list[DocumentEmbedding]:
+        """Bulk-insert one row per (chunk_index, chunk_text, embedding, metadata)."""
+        rows = [
+            DocumentEmbedding(
+                document_id=document_id,
+                chunk_index=chunk_index,
+                chunk_text=chunk_text,
+                embedding=embedding,
+                chunk_metadata=metadata,
+            )
+            for chunk_index, chunk_text, embedding, metadata in chunks
+        ]
+        self._session.add_all(rows)
+        await self._session.flush()
+        return rows
+
+    async def list_documents(self, profile_id: UUID) -> list[Document]:
+        """All documents a profile has uploaded, newest first."""
+        stmt = (
+            select(Document)
+            .where(Document.profile_id == profile_id)
+            .order_by(Document.created_at.desc())
+        )
+        result = await self._session.scalars(stmt)
+        return list(result.all())
+
+    async def search_document_chunks(
+        self, profile_id: UUID, query_embedding: list[float], top_k: int = 5
+    ) -> list[dict]:
+        """Cosine-similarity search over one profile's document chunks only.
+
+        The profile_id filter is baked into this query (via the join to
+        Document), not applied afterwards -- so there is no code path that
+        can return another profile's chunks, regardless of who calls this.
+        """
+        distance = DocumentEmbedding.embedding.cosine_distance(query_embedding)
+        stmt = (
+            select(
+                DocumentEmbedding.chunk_text,
+                DocumentEmbedding.chunk_index,
+                DocumentEmbedding.chunk_metadata,
+                Document.filename,
+                Document.id.label("document_id"),
+                distance.label("distance"),
+            )
+            .join(Document, Document.id == DocumentEmbedding.document_id)
+            .where(Document.profile_id == profile_id)
+            .order_by(distance)
+            .limit(top_k)
+        )
+        result = await self._session.execute(stmt)
+        return [
+            {
+                "filename": row.filename,
+                "chunk_text": row.chunk_text,
+                "chunk_index": row.chunk_index,
+                "document_id": str(row.document_id),
+                "metadata": row.chunk_metadata,
+                # cosine_distance is 1 - cosine_similarity; similarity is
+                # the more intuitive "relevance score" to hand back to the LLM/UI.
+                "similarity": round(1 - row.distance, 4),
+            }
+            for row in result.all()
+        ]
 
     async def execute_raw_sql(self, sql: str) -> list[dict]:
         """Execute a read-only SQL query and return rows as plain dicts.
