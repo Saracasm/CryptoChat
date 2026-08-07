@@ -40,7 +40,7 @@ newgrp docker   # or log out/in so the group change applies
 git clone <your-repo-url>
 cd CryptoChat
 cp .env.example .env
-nano .env   # fill in POSTGRES_PASSWORD, OPENROUTER_API_KEY, GEMINI_API_KEY
+nano .env   # fill in POSTGRES_PASSWORD, OPENROUTER_API_KEY, GEMINI_API_KEY, API_KEY, JWT_SECRET
 ```
 
 Set `ALLOWED_ORIGINS` in `.env` to `http://<public-ip>:3000` once you know
