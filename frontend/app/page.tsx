@@ -13,6 +13,7 @@ import { ThemeToggle } from "@/components/theme-toggle";
 const Plot = dynamic(() => import("react-plotly.js"), { ssr: false });
 
 type Message = {
+  id?: string;
   role: string;
   content: string;
 };
@@ -376,6 +377,20 @@ export default function ChatInterface() {
     if (!dashboardCollapsed && token) loadDocuments();
   }, [dashboardCollapsed, loadDocuments, token]);
 
+  async function deleteDocument(documentId: string) {
+    if (!token) return;
+    setDocuments((current) => current.filter((doc) => doc.id !== documentId));
+    const response = await fetch(`/api/documents/${documentId}`, {
+      method: "DELETE",
+      headers: authHeaders(),
+    });
+    if (!response.ok && response.status !== 204) {
+      // Deletion failed server-side -- resync with the real list rather
+      // than leave the optimistic removal showing a document that's still there.
+      await loadDocuments();
+    }
+  }
+
   async function handleFileSelected(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     event.target.value = ""; // reset so re-selecting the same file re-triggers onChange
@@ -549,23 +564,28 @@ export default function ChatInterface() {
     setDraft("");
     setSending(true);
 
-    const response = await fetch(
-      `/api/conversations/${conversationId}/messages`,
-      {
-        method: "POST",
-        headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ content: text }),
-      }
-    );
-    const reply = await response.json();
+    await fetch(`/api/conversations/${conversationId}/messages`, {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ content: text }),
+    });
 
-    setMessages((current) => [
-      ...current,
-      { role: reply.role, content: reply.content },
-    ]);
+    // Reload from the DB rather than appending the reply locally -- this
+    // also picks up real ids for both the user turn and the reply, which
+    // deleteMessage needs (the POST response only carries the reply's id).
+    await openConversation(conversationId);
     setSending(false);
     await loadConversationList(token);
     await loadPortfolio();
+  }
+
+  async function deleteMessage(messageId: string) {
+    if (!token || !conversationId) return;
+    await fetch(`/api/conversations/${conversationId}/messages/${messageId}`, {
+      method: "DELETE",
+      headers: authHeaders(),
+    });
+    setMessages((current) => current.filter((m) => m.id !== messageId));
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -780,14 +800,34 @@ export default function ChatInterface() {
             <div className="space-y-3">
               {messages.map((message, index) => (
                 <div
-                  key={index}
+                  key={message.id ?? index}
                   className={
                     message.role === "user"
-                      ? "ml-auto max-w-[80%] rounded-2xl bg-primary px-4 py-3 text-primary-foreground"
-                      : "max-w-[80%] rounded-2xl bg-muted px-4 py-3"
+                      ? "group ml-auto flex w-fit max-w-[80%] items-start gap-2"
+                      : "group flex w-fit max-w-[80%] items-start gap-2"
                   }
                 >
-                  {message.role === "user" ? message.content : <Markdown content={message.content} />}
+                  <div
+                    className={
+                      message.role === "user"
+                        ? "rounded-2xl bg-primary px-4 py-3 text-primary-foreground"
+                        : "rounded-2xl bg-muted px-4 py-3"
+                    }
+                  >
+                    {message.role === "user" ? message.content : <Markdown content={message.content} />}
+                  </div>
+                  {message.id && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      aria-label="Delete message"
+                      className="mt-1 size-6 shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
+                      onClick={() => deleteMessage(message.id!)}
+                    >
+                      <Trash2 className="size-3.5" />
+                    </Button>
+                  )}
                 </div>
               ))}
               {sending && (
@@ -992,15 +1032,25 @@ export default function ChatInterface() {
                   {documents.map((doc) => (
                     <div
                       key={doc.id}
-                      className="flex items-center gap-2 rounded-lg border px-3 py-2"
+                      className="group flex items-center gap-2 rounded-lg border px-3 py-2"
                     >
                       <FileText className="size-4 shrink-0 text-muted-foreground" />
-                      <div className="min-w-0">
+                      <div className="min-w-0 flex-1">
                         <p className="truncate text-sm font-medium">{doc.filename}</p>
                         <p className="truncate text-xs text-muted-foreground">
                           {new Date(doc.created_at).toLocaleDateString()}
                         </p>
                       </div>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        aria-label={`Delete ${doc.filename}`}
+                        className="size-6 shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
+                        onClick={() => deleteDocument(doc.id)}
+                      >
+                        <Trash2 className="size-3.5" />
+                      </Button>
                     </div>
                   ))}
                 </div>

@@ -78,6 +78,16 @@ class Repository:
         result = await self._session.scalars(stmt)
         return list(result.all())
 
+    async def get_message(self, conversation_id: UUID, message_id: UUID) -> Message | None:
+        stmt = select(Message).where(
+            Message.id == message_id, Message.conversation_id == conversation_id
+        )
+        return await self._session.scalar(stmt)
+
+    async def delete_message(self, message: Message) -> None:
+        await self._session.delete(message)
+        await self._session.flush()
+
     async def add_holding(
         self, conversation_id: UUID, coin: str, amount: float, buy_price: float) -> Holding:
         """Record one purchase (a lot)."""
@@ -91,18 +101,19 @@ class Repository:
         await self._session.flush()
         return holding
 
-    async def get_holdings(self, conversation_id: UUID) -> list[Holding]:
-        """All purchase lots in this conversation."""
+    async def get_holdings(
+        self, conversation_id: UUID, coin: str | None = None
+    ) -> list[Holding]:
+        """All purchase lots in this conversation, optionally filtered to one coin
+        (case-insensitive)."""
         stmt = select(Holding).where(Holding.conversation_id == conversation_id)
+        if coin is not None:
+            stmt = stmt.where(func.lower(Holding.coin) == coin.lower())
         result = await self._session.scalars(stmt)
         return list(result.all())
 
     async def holding_exists(self, conversation_id: UUID, coin: str, amount: float, buy_price: float) -> bool:
-        """Check if an identical holding was already logged in this conversation.
-
-        Prevents the agent from logging the same purchase twice when it
-        re-reads earlier messages in the history.
-        """
+        """Check if an identical holding was already logged (prevents duplicate logging)."""
         stmt = select(Holding).where(
             Holding.conversation_id == conversation_id,
             Holding.coin == coin,
@@ -116,11 +127,7 @@ class Repository:
         new_amount: float | None = None,
         new_buy_price: float | None = None,
         old_buy_price: float | None = None,) -> bool:
-        """Correct an existing holding for a coin in this conversation.
-
-        Finds the matching holding (optionally by its old price) and updates
-        its amount and/or buy price. Returns True if something was updated.
-        """
+        """Correct a holding's amount/price (optionally matched by old price). Returns True if updated."""
         stmt = select(Holding).where(
             Holding.conversation_id == conversation_id,
             Holding.coin == coin,
@@ -145,11 +152,7 @@ class Repository:
         coin: str,
         buy_price: float | None = None,
     ) -> bool:
-        """Delete a holding for a coin in this conversation.
-
-        If buy_price is given, only deletes the matching lot; otherwise
-        deletes the first holding found for that coin. Returns True if deleted.
-        """
+        """Delete a holding for a coin, or a specific lot if buy_price is given."""
         stmt = select(Holding).where(
             Holding.conversation_id == conversation_id,
             Holding.coin == coin,
@@ -209,15 +212,22 @@ class Repository:
         result = await self._session.scalars(stmt)
         return list(result.all())
 
+    async def get_document(self, profile_id: UUID, document_id: UUID) -> Document | None:
+        stmt = select(Document).where(
+            Document.id == document_id, Document.profile_id == profile_id
+        )
+        return await self._session.scalar(stmt)
+
+    async def delete_document(self, document: Document) -> None:
+        """Delete a document; cascades to its DocumentEmbedding rows."""
+        await self._session.delete(document)
+        await self._session.flush()
+
     async def search_document_chunks(
         self, profile_id: UUID, query_embedding: list[float], top_k: int = 5
     ) -> list[dict]:
-        """Cosine-similarity search over one profile's document chunks only.
-
-        The profile_id filter is baked into this query (via the join to
-        Document), not applied afterwards -- so there is no code path that
-        can return another profile's chunks, regardless of who calls this.
-        """
+        """Cosine-similarity search over one profile's chunks; profile_id is
+        scoped via the join, not filtered after the fact."""
         distance = DocumentEmbedding.embedding.cosine_distance(query_embedding)
         stmt = (
             select(
@@ -241,24 +251,23 @@ class Repository:
                 "chunk_index": row.chunk_index,
                 "document_id": str(row.document_id),
                 "metadata": row.chunk_metadata,
-                # cosine_distance is 1 - cosine_similarity; similarity is
-                # the more intuitive "relevance score" to hand back to the LLM/UI.
-                "similarity": round(1 - row.distance, 4),
+                "similarity": round(1 - row.distance, 4),  # cosine_distance = 1 - similarity
             }
             for row in result.all()
         ]
 
     async def execute_raw_sql(self, sql: str) -> list[dict]:
-        """Execute a read-only SQL query and return rows as plain dicts.
-        Only SELECT statements are allowed -- this exists to let the SQL
-        subagent answer questions, not to let it mutate data.
-        """
+        """Execute a read-only SQL query (SELECT only) and return rows as plain dicts."""
         cleaned = sql.strip().rstrip(";")
         if not cleaned.lower().startswith("select"):
             raise ValueError("Only SELECT queries are permitted here.")
         result = await self._session.execute(text(cleaned))
         rows = result.mappings().all()
         return [dict(row) for row in rows]
+
+    async def rollback(self) -> None:
+        """Reset the session after a failed raw query (Postgres aborts the whole transaction)."""
+        await self._session.rollback()
 
 
     async def create_profile_with_password(self, username: str, password: str) -> Profile:

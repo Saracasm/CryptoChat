@@ -1,9 +1,5 @@
 """RAG ingestion pipeline: raw uploaded bytes -> extracted text -> token
-chunks -> embeddings -> Document + DocumentEmbedding rows.
-
-Kept separate from the router (same pattern as visualization.py) so it can
-be tested and reasoned about without an HTTP layer in the way.
-"""
+chunks -> embeddings -> Document + DocumentEmbedding rows."""
 
 from io import BytesIO
 
@@ -13,7 +9,7 @@ from markitdown import MarkItDown
 from app.embeddings import embed_texts
 from app.repository import Repository
 
-# filename extension -> MarkItDown's expected file_extension hint.
+# filename extension -> MarkItDown's file_extension hint.
 ALLOWED_EXTENSIONS = {
     ".pdf": ".pdf",
     ".docx": ".docx",

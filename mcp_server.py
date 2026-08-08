@@ -1,14 +1,8 @@
-# from uuid import UUID
-
 from datetime import datetime, timezone
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 from app.visualization import COINGECKO_BASE, get_json, get_market_chart, resolve_coin_id
-# from sqlalchemy import select
-
-# from app.database import SessionLocal
-# from app.models import Holding
 
 mcp = FastMCP("crypto-tools", host="127.0.0.1", port=8001)
 
@@ -86,8 +80,7 @@ async def get_historical_prices(
     except httpx.HTTPError as exc:
         return {"error": f"Could not fetch historical prices for '{coin}': {exc}"}
 
-    # CoinGecko returns [unix_milliseconds, price] pairs. Named fields are
-    # easier for the LLM and frontend to consume safely.
+    # Named fields are easier for the LLM/frontend to consume than raw [ts, price] pairs.
     prices = [
         {
             "timestamp": datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(),
@@ -245,28 +238,6 @@ async def get_portfolio_risk(positions: list[dict]) -> dict:
         "risk_level": "high" if largest_weight >= 60 or hhi >= 0.45 else "medium" if largest_weight >= 35 or hhi >= 0.25 else "low",
         "interpretation": "Concentration risk is driven mainly by the largest positions; this is not investment advice.",
     }
-
-
-# @mcp.resource("crypto://global-market")
-# async def global_market_snapshot() -> dict:
-#     """Global crypto market reference data: total market cap, 24h volume,
-#     and BTC/ETH dominance. Exposed as a resource (not a tool) because it's
-#     read-only background context an MCP client can pull into its own
-#     context window directly -- no LLM round-trip needed to decide whether
-#     or how to call it, unlike a tool.
-#     """
-#     async with httpx.AsyncClient() as client:
-#         resp = await client.get(f"{COINGECKO_BASE}/global")
-#         data = resp.json().get("data", {})
-
-#     return {
-#         "active_cryptocurrencies": data.get("active_cryptocurrencies"),
-#         "total_market_cap_usd": data.get("total_market_cap", {}).get("usd"),
-#         "total_volume_24h_usd": data.get("total_volume", {}).get("usd"),
-#         "market_cap_change_24h_percent": data.get("market_cap_change_percentage_24h_usd"),
-#         "btc_dominance_percent": data.get("market_cap_percentage", {}).get("btc"),
-#         "eth_dominance_percent": data.get("market_cap_percentage", {}).get("eth"),
-#     }
 
 
 if __name__ == "__main__":

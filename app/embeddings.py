@@ -1,7 +1,5 @@
-"""Gemini embeddings, used both to index document chunks at ingest time and
-to embed the live query at retrieval time. Batched so a multi-chunk document
-doesn't cost one API call per chunk against the free-tier rate limit.
-"""
+"""Gemini embeddings, used both at ingest time and query time. Batched to
+avoid one API call per chunk on the free-tier rate limit."""
 
 from google import genai
 
@@ -9,10 +7,7 @@ from app.config import settings
 
 _client = genai.Client(api_key=settings.gemini_api_key)
 
-# Gemini's embed_content endpoint accepts a batch, but caps how many inputs
-# it will take in one call. Chunking our own batches keeps big documents
-# (100+ chunks) from either failing outright or blowing through the
-# free-tier per-request payload limit.
+# Chunking our own batches keeps big documents from blowing the per-request payload limit.
 _BATCH_SIZE = 100
 
 

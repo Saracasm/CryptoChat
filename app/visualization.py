@@ -1,10 +1,5 @@
-"""Safe, backend-generated market visualizations.
-
-The returned `chart` is Plotly figure JSON, which the frontend can render with
-Plotly later. `python_code` is deliberately an editable *artifact*, not code
-executed by the API; this avoids running untrusted user or model Python in the
-FastAPI process.
-"""
+"""Safe, backend-generated market visualizations. `chart` is Plotly figure JSON;
+`python_code` is a display-only artifact, never executed by the API."""
 
 import asyncio
 from datetime import datetime, timezone
@@ -181,12 +176,8 @@ MARKET_DATAFRAME_COLUMNS = [
 
 
 async def build_multi_coin_dataframe(coins: list[str], days: int = 30) -> list[dict]:
-    """Fetch daily market history for one or more coins and return a single
-    long-format dataframe (one row per coin per day: date, coin, price_usd,
-    daily_change_pct, market_cap_usd, volume_usd). Powers both single-coin
-    trend charts and multi-coin comparisons (e.g. "compare BTC and ETH this
-    month") from the same shape.
-    """
+    """Fetch daily market history for one or more coins as a single long-format
+    dataframe (one row per coin per day). Powers both single- and multi-coin charts."""
     if not 1 <= days <= 365:
         raise ValueError("days must be between 1 and 365")
     if not coins:
@@ -223,11 +214,7 @@ async def build_multi_coin_dataframe(coins: list[str], days: int = 30) -> list[d
 
 
 def portfolio_dataframe(portfolio: dict) -> list[dict]:
-    """Reshape a get_portfolio_report() dict into per-coin rows, dropping
-    the `_total`/`_meta` bookkeeping keys. Shared by the built-in portfolio
-    charts and the "make your own graph" custom-chart dataframe -- one
-    place defines what "the portfolio dataframe" means.
-    """
+    """Reshape a get_portfolio_report() dict into per-coin rows, dropping _total/_meta."""
     return [
         {"coin": coin, **position}
         for coin, position in portfolio.items()

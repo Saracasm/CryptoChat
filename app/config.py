@@ -11,7 +11,6 @@ class Settings(BaseSettings):
     gemini_embedding_model: str = "gemini-embedding-001"
     embedding_dimensions: int = 768
     logfire_token: str | None = None
-    # groq_api_key: str
     api_key: str
     jwt_secret: str
     # Comma-separated list, e.g. "http://localhost:3000,http://1.2.3.4:3000".

@@ -95,8 +95,7 @@ class Holding(Base):
 
 
 class Document(Base):
-    """One uploaded, RAG-ingestible file. Owned by a profile, never shared
-    across profiles -- retrieval always filters on profile_id."""
+    """One uploaded, RAG-ingestible file, owned by a profile."""
 
     __tablename__ = "documents"
 

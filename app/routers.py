@@ -5,8 +5,8 @@ from fastapi.security import OAuth2PasswordRequestForm
 import httpx
 
 from app.agent import (
-    CONTEXT_WINDOW,
     Deps,
+    TITLE_SUMMARY_THRESHOLD,
     get_portfolio_report,
     get_reply,
     plan_visualization,
@@ -137,6 +137,25 @@ async def get_conversation_portfolio(
     return await get_portfolio_report(repo, conversation_id)
 
 
+@conversations_router.delete(
+    "/{conversation_id}/messages/{message_id}", status_code=204
+)
+async def delete_message(
+    conversation_id: UUID,
+    message_id: UUID,
+    profile: Profile = Depends(get_current_profile),
+    repo: Repository = Depends(get_repository),
+):
+    """Delete one message from the conversation, permanently, from the DB."""
+    conversation = await repo.get_conversation(profile.id, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    message = await repo.get_message(conversation_id, message_id)
+    if message is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    await repo.delete_message(message)
+
+
 @conversations_router.post(
     "/{conversation_id}/messages", response_model=MessageRead
 )
@@ -164,8 +183,8 @@ async def send_message(
     if conversation.title is None:
         title = await summarize_title(full_messages)
         await repo.set_title(conversation, title)
-    elif len(history) < CONTEXT_WINDOW <= total_messages:
-        title = await summarize_title(full_messages[:CONTEXT_WINDOW])
+    elif len(history) < TITLE_SUMMARY_THRESHOLD <= total_messages:
+        title = await summarize_title(full_messages[:TITLE_SUMMARY_THRESHOLD])
         await repo.set_title(conversation, title)
 
     return reply
@@ -180,9 +199,7 @@ async def create_portfolio_chart_endpoint(
     profile: Profile = Depends(get_current_profile),
     repo: Repository = Depends(get_repository),
 ):
-    """Create a private chart (allocation / P&L / cost-vs-value) from the
-    authenticated conversation's own portfolio. Reuses get_portfolio_report --
-    the same math the chat agent uses -- so figures never drift apart."""
+    """Create a portfolio chart, reusing get_portfolio_report so figures never drift from the chat agent's."""
     conversation = await repo.get_conversation(profile.id, conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -203,11 +220,7 @@ async def list_dataframes(
     profile: Profile = Depends(get_current_profile),
     repo: Repository = Depends(get_repository),
 ):
-    """What "Make your own graph" can currently plot: the private portfolio
-    dataframe (same shape the built-in portfolio charts use), with its
-    columns and a small preview so the UI can show what's available
-    without shipping the full dataset up front.
-    """
+    """What "Make your own graph" can plot: columns + a small preview, not the full dataset."""
     conversation = await repo.get_conversation(profile.id, conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -237,13 +250,8 @@ async def create_custom_chart(
     profile: Profile = Depends(get_current_profile),
     repo: Repository = Depends(get_repository),
 ):
-    """"Make your own graph": either run user-written code against the
-    private portfolio dataframe, or -- when only a `prompt` is given --
-    delegate to the visualization planner, which can also reach for public
-    market history, not just the portfolio. Code (whichever path produced
-    it) always runs sandboxed (see app/sandbox.py), never directly in this
-    process's own interpreter.
-    """
+    """"Make your own graph": run user code against the portfolio, or delegate to the
+    visualization planner if only `prompt` is given. Code always runs sandboxed."""
     conversation = await repo.get_conversation(profile.id, conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -306,9 +314,7 @@ async def upload_document(
     profile: Profile = Depends(get_current_profile),
     repo: Repository = Depends(get_repository),
 ):
-    """Ingest one file into the acting profile's private RAG corpus:
-    extract text (MarkItDown) -> chunk (Chonkie) -> embed (Gemini) -> store.
-    """
+    """Ingest one file into the profile's RAG corpus: extract -> chunk -> embed -> store."""
     file_bytes = await file.read()
     try:
         summary = await ingest_document(
@@ -329,3 +335,16 @@ async def list_documents(
     repo: Repository = Depends(get_repository),
 ):
     return await repo.list_documents(profile.id)
+
+
+@documents_router.delete("/{document_id}", status_code=204)
+async def delete_document(
+    document_id: UUID,
+    profile: Profile = Depends(get_current_profile),
+    repo: Repository = Depends(get_repository),
+):
+    """Delete an uploaded document and all of its chunk embeddings."""
+    document = await repo.get_document(profile.id, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    await repo.delete_document(document)

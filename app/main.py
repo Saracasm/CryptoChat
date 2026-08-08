@@ -10,10 +10,8 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Configure tracing before importing anything that creates agents/DB
-# connections, so every span (HTTP, LLM calls, DB queries) gets captured
-# from app startup. send_to_logfire="if-token-present" keeps local dev/tests
-# working without a token -- it just no-ops instead of erroring.
+# Configure tracing before importing anything that creates agents/DB connections,
+# so every span is captured from app startup.
 logfire.configure(
     token=settings.logfire_token,
     send_to_logfire="if-token-present",

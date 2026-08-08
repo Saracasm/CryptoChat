@@ -1,24 +1,6 @@
-"""Sandboxed execution of small pandas/plotly code snippets, for the "Make
-your own graph" feature. Two independent layers of defense:
-
-1. AST validation (validate_code): a whitelist of allowed syntax nodes,
-   plus explicit blocking of dunder access (the classic
-   `().__class__.__bases__[0].__subclasses__()` sandbox-escape trick) and a
-   handful of dangerous method names (show/write_image/open/...). No
-   `import` statement is allowed at all -- pandas and plotly are the only
-   two libraries ever placed in the execution namespace, so there is
-   nothing to import that isn't already there.
-2. Process isolation (run_sandboxed): even code that passed AST validation
-   runs in a throwaway subprocess with a hard wall-clock timeout and a
-   polled memory ceiling, never in the FastAPI process itself. If it hangs,
-   leaks memory, or crashes, only the subprocess dies.
-
-This is deliberately not a claim that arbitrary Python is "100% safe" --
-sandboxing a full general-purpose language is a famously hard problem -- but
-combined, these two layers cover everything the spec calls for: no imports,
-no filesystem, no network, no subprocesses, no DB access, bounded time and
-memory.
-"""
+"""Sandboxed execution of small pandas/plotly code snippets ("Make your own graph").
+Two layers of defense: AST whitelist validation (validate_code), then process
+isolation with a timeout and memory ceiling (run_sandboxed)."""
 
 import ast
 import asyncio
@@ -36,21 +18,14 @@ try:
 except ImportError:  # pragma: no cover - psutil is a declared dependency
     psutil = None
 
-# On Windows, spawning a subprocess from an asyncio event loop that has
-# already done async network I/O (e.g. the OpenRouter call in
-# generate_chart_code) is measurably slower than a cold spawn -- consistently
-# ~9s in testing here, vs ~2s standalone. That's a ProactorEventLoop +
-# multiprocessing-spawn interaction, not a hang, so the default timeout
-# needs headroom above it rather than being tuned to the cold-spawn case.
+# Windows: spawning a subprocess after async network I/O is measurably slower
+# (~9s vs ~2s cold) -- a ProactorEventLoop quirk, not a hang, hence the headroom.
 DEFAULT_TIMEOUT_SECONDS = 15
 DEFAULT_MEMORY_LIMIT_MB = 300
 _POLL_INTERVAL_SECONDS = 0.05
 
-# Whitelist, not blacklist: any AST node type not in this set is rejected.
-# This covers straight-line code, simple `for`/`if` control flow, and
-# comprehensions -- everything a pandas/plotly one-to-few-liner needs.
-# Notably absent: Import, ImportFrom, FunctionDef, ClassDef, Try, With,
-# Global, Nonlocal, While, Delete, Raise, Assert, Yield, Await.
+# Whitelist, not blacklist: any AST node type not listed is rejected (no imports,
+# def/class, try/with, while, etc.).
 ALLOWED_NODE_TYPES = (
     ast.Module,
     ast.Expr,
@@ -118,28 +93,22 @@ ALLOWED_NODE_TYPES = (
     ast.Starred,
 )
 
-# Rejected at AST time even though the restricted builtins below would
-# already make them fail at runtime -- this gives a clear, immediate error
-# instead of a confusing NameError, and closes the door before execution
-# ever starts.
+# Rejected at AST time for a clear error, even though restricted builtins would
+# already fail these at runtime.
 BLOCKED_NAMES = {
     "eval", "exec", "compile", "open", "input", "__import__", "getattr",
     "setattr", "delattr", "globals", "locals", "vars", "help", "breakpoint",
     "memoryview", "classmethod", "staticmethod", "super", "type",
 }
 
-# Attribute access that's syntactically harmless but would open a browser
-# tab, spawn a subprocess (kaleido, for image export), or touch disk/network
-# -- blocked no matter which object it's called on.
+# Blocked regardless of object: would open a browser tab, spawn a subprocess, or touch disk/network.
 BLOCKED_ATTRS = {
     "show", "write_image", "write_html", "write_json", "to_html",
     "open", "read", "write", "system", "popen", "spawn", "fork",
     "connect", "urlopen", "request", "get", "post",
 }
 
-# Everything the sandboxed code is allowed to call by name. Deliberately
-# small -- enough for pandas/plotly data wrangling, nothing that touches
-# the filesystem, network, or process.
+# Deliberately small: enough for pandas/plotly wrangling, nothing that touches disk/network.
 _SAFE_BUILTINS = {
     "len": len, "range": range, "enumerate": enumerate, "min": min,
     "max": max, "sum": sum, "sorted": sorted, "list": list, "dict": dict,
@@ -155,9 +124,7 @@ class SandboxError(ValueError):
 
 
 def validate_code(code: str) -> ast.Module:
-    """Parse and whitelist-check the code. Raises SandboxError on any
-    disallowed construct. Returns the parsed tree (unused by callers today,
-    but useful for tests / future static checks)."""
+    """Parse and whitelist-check the code. Raises SandboxError on any disallowed construct."""
     try:
         tree = ast.parse(code, mode="exec")
     except SyntaxError as exc:
@@ -183,10 +150,7 @@ def validate_code(code: str) -> ast.Module:
 
 
 def _worker(code: str, dataframes: dict[str, list[dict]], result_queue) -> None:
-    """Runs inside the isolated subprocess. Never has access to anything
-    beyond `_SAFE_BUILTINS`, `pd`, `px`, `go`, and the given dataframes --
-    in particular, no `__builtins__` module, no `os`/`sys`/`subprocess`.
-    """
+    """Runs in the isolated subprocess with only _SAFE_BUILTINS, pd, px, go, dataframes."""
     try:
         exec_globals = {"__builtins__": _SAFE_BUILTINS, "pd": pd, "px": px, "go": go}
         for name, records in dataframes.items():
@@ -206,8 +170,7 @@ def _worker(code: str, dataframes: dict[str, list[dict]], result_queue) -> None:
 
         chart_json = json.loads(pio.to_json(fig))
         result_queue.put({"chart": chart_json})
-    except Exception as exc:  # noqa: BLE001 - deliberately broad: any failure
-        # inside untrusted code becomes a clean error message, not a crash.
+    except Exception as exc:  # noqa: BLE001 - broad on purpose: untrusted code -> clean error
         result_queue.put({"error": f"{type(exc).__name__}: {exc}"})
 
 
@@ -217,10 +180,7 @@ def run_sandboxed(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     memory_limit_mb: float = DEFAULT_MEMORY_LIMIT_MB,
 ) -> dict:
-    """Validate then execute `code` in an isolated subprocess, enforcing a
-    wall-clock timeout and a polled memory ceiling. Blocking -- call via
-    run_sandboxed_async from async code.
-    """
+    """Validate then run `code` in an isolated subprocess with a timeout/memory ceiling. Blocking."""
     validate_code(code)
 
     ctx = multiprocessing.get_context("spawn")
@@ -278,8 +238,7 @@ async def run_sandboxed_async(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     memory_limit_mb: float = DEFAULT_MEMORY_LIMIT_MB,
 ) -> dict:
-    """Async wrapper -- run_sandboxed blocks on process.join()/sleep(), so it
-    runs off the event loop thread."""
+    """Async wrapper -- run_sandboxed blocks, so it runs off the event loop thread."""
     return await asyncio.to_thread(
         run_sandboxed, code, dataframes, timeout_seconds, memory_limit_mb
     )

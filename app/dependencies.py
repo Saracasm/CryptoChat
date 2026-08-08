@@ -14,10 +14,7 @@ async def require_api_key(x_api_key: str = Header(...)) -> None:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 async def get_session() -> AsyncSession:
-    """One database session per request = one unit of work.
-
-    Commits if the request succeeds, rolls back if anything raises.
-    """
+    """One session per request: commits on success, rolls back if anything raises."""
     async with SessionLocal() as session:
         try:
             yield session

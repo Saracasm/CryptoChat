@@ -52,10 +52,7 @@ from app.database import Base
 
 
 def get_schema_text() -> str:
-    """Introspect the SQLAlchemy schema (Base.metadata) and render it as
-    readable text: tables, columns, types, primary keys, and foreign keys.
-    Used to ground the SQL subagent in the real, current database schema.
-    """
+    """Render Base.metadata as readable text, to ground the SQL subagent."""
     lines = []
     for table in Base.metadata.sorted_tables:
         lines.append(f"Table: {table.name}")
@@ -78,8 +75,12 @@ sql_agent = Agent(
         "Given a task describing what data is needed, write a single correct "
         "PostgreSQL query that accomplishes it. Use only the tables and "
         "columns given to you in the schema -- never invent column or table "
-        "names. Reply with ONLY the SQL query, no explanation, no markdown "
-        "code fences."
+        "names. You are never shown real data values, only column names and "
+        "types, so never assume the exact casing of a text value (e.g. a "
+        "coin name or id) -- always compare text columns case-insensitively, "
+        "e.g. `WHERE lower(coin) = lower('bitcoin')` or `WHERE coin ILIKE "
+        "'bitcoin'`, not a case-sensitive `=`. Reply with ONLY the SQL "
+        "query, no explanation, no markdown code fences."
     ),
 )
 
@@ -117,11 +118,7 @@ chart_code_agent = Agent(
 
 
 async def generate_chart_code(prompt: str, columns: list[str]) -> str:
-    """Ask the model for a sandboxed pandas/plotly snippet answering `prompt`
-    against a dataframe with the given columns. Returned code still goes
-    through app.sandbox.validate_code before ever being executed -- this
-    function does not itself guarantee safe output.
-    """
+    """Ask the model for a chart snippet; caller must still validate/sandbox it."""
     task = f"Available columns on `df`: {', '.join(columns)}.\nUser request: {prompt}"
     result = await chart_code_agent.run(task, deps=Deps(repo=None, conversation_id=None))
     code = result.output.strip()
@@ -133,24 +130,13 @@ async def generate_chart_code(prompt: str, columns: list[str]) -> str:
 
 
 class VisualizationPlan(BaseModel):
-    """Structured output of visualization_planner_agent: which data source,
-    chart shape, and fields answer a free-text chart request -- decided
-    before any code is generated, so the code-gen step has a concrete,
-    grounded target instead of guessing from the raw request alone."""
+    """Planner output: data source, chart shape, and fields for a chart request."""
 
     data_source: Literal["portfolio", "market"]
     chart_type: Literal["donut", "bar", "grouped_bar", "line", "multi_line"]
     coins: list[str] = Field(default_factory=list)
-    # Plain str, not a Literal: this only matters for a single-coin market
-    # line chart, so for portfolio requests the model sometimes fills it
-    # with an unrelated (but harmless) value like a portfolio column name --
-    # a Literal would make that a hard validation failure for no reason,
-    # since nothing downstream actually reads this field today.
-    metric: str = "price_usd"
-    # Deliberately unconstrained (no ge/le): some OpenRouter providers reject
-    # tool schemas containing JSON Schema "minimum"/"maximum" keywords. The
-    # 1-365 range is enforced downstream instead, in build_multi_coin_dataframe.
-    days: int = 30
+    metric: str = "price_usd"  # plain str, not Literal: only matters for single-coin market lines
+    days: int = 30  # unconstrained: some OpenRouter providers reject min/max in tool schemas
     x_field: str
     y_field: str
     reasoning: str
@@ -208,14 +194,8 @@ visualization_planner_agent = Agent(
 
 
 async def plan_visualization(deps: Deps, request: str) -> dict:
-    """Plan then build a chart from a free-text request: pick a data source
-    (the caller's private portfolio, or public market history), a chart
-    shape, and x/y fields, then generate and sandbox-execute the Plotly/
-    pandas code for it. Returns {plan, dataframe, code, chart} or {"error"}
-    on any failure along the way -- never raises for a bad/ambiguous
-    request, since this is called directly from both a chat tool and a REST
-    endpoint that both need a clean error message rather than a 500.
-    """
+    """Plan, fetch data, generate, and sandbox-run a chart for a free-text request.
+    Returns {plan, dataframe, code, chart} or {"error"}; never raises."""
     plan_result = await visualization_planner_agent.run(request, deps=deps)
     raw_plan = plan_result.output.strip()
     if raw_plan.startswith("```"):
@@ -290,31 +270,20 @@ SAMPLE_ROW_COUNT = 5
 
 
 def _coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """SQL NUMERIC/DECIMAL columns come back from asyncpg as Python
-    Decimal objects, which pandas stores as generic 'object' dtype --
-    select_dtypes(include="number") then silently misses them entirely,
-    so cost/price/amount columns (the ones we most want stats on) would
-    never get analyzed. Convert any object column that's actually numeric
-    (Decimals, numeric strings) to float; leave true text columns alone.
-    """
+    """asyncpg returns NUMERIC as Decimal (object dtype); coerce those to float so
+    select_dtypes("number") actually finds them, without touching real text columns."""
     df = df.copy()
     for col in df.columns:
         if df[col].dtype == object:
             converted = pd.to_numeric(df[col], errors="coerce")
-            # Only adopt the conversion if every non-null value converted
-            # cleanly -- otherwise this is a genuine text column and
-            # coercing it would just turn it into all-NaN noise.
+            # Only adopt if every non-null value converted cleanly.
             if converted.notna().equals(df[col].notna()):
                 df[col] = converted
     return df
 
 
 def _dataframe_facts(df: pd.DataFrame) -> dict:
-    """Compute grounded, non-hallucinatable facts about a DataFrame:
-    per-column numeric stats, the rows holding each column's min/max, and
-    IQR-based outliers. These facts -- not the raw rows -- are what get
-    handed to the summarizer LLM, so it has nothing to invent from.
-    """
+    """Compute grounded stats/outliers so the summarizer LLM has nothing to invent."""
     df = _coerce_numeric_columns(df)
     numeric_cols = list(df.select_dtypes(include="number").columns)
 
@@ -355,11 +324,7 @@ def _dataframe_facts(df: pd.DataFrame) -> dict:
 
 
 async def summarize_dataframe(rows: list[dict], task: str) -> dict:
-    """Turn a large query result into grounded metrics plus a short,
-    fact-checked natural-language explanation, instead of returning every
-    row. Used by write_sql_query once a result exceeds
-    DATAFRAME_SUMMARY_ROW_THRESHOLD rows.
-    """
+    """Turn a large query result into grounded metrics plus a short explanation."""
     df = pd.DataFrame(rows)
     facts = _dataframe_facts(df)
 
@@ -385,7 +350,10 @@ async def summarize_dataframe(rows: list[dict], task: str) -> dict:
     }
 
 
-CONTEXT_WINDOW = 6
+# Messages kept verbatim before older ones get folded into a running summary.
+CONTEXT_WINDOW = 25
+# Messages needed before a conversation gets an auto-generated title.
+TITLE_SUMMARY_THRESHOLD = 6
 
 summary_cache: dict[UUID, tuple[str, int]] = {}
 
@@ -400,12 +368,7 @@ summarizer_agent = Agent(
 
 async def _summarize_messages(
     messages: list[ModelMessage], previous_summary: str | None = None) -> str:
-    """Call the model to compress a chunk of turns into a short summary.
-
-    If previous_summary is given, the model extends it to also cover the
-    new chunk, so only the newly-aged-out messages need to be read instead
-    of re-summarizing the whole growing "old" portion from scratch.
-    """
+    """Compress a chunk of turns into a summary, extending previous_summary if given."""
     lines = []
     for m in messages:
         for part in m.parts:
@@ -430,20 +393,12 @@ async def _summarize_messages(
             "(coins mentioned, amounts, prices, corrections/removals made). "
             "Reply with the summary only.\n\n" + convo
         )
-    # result = await agent.run(prompt, deps=Deps(repo=None, conversation_id=None))
     result = await summarizer_agent.run(prompt, deps=Deps(repo=None, conversation_id=None))
     return result.output.strip()
 
 async def _compact_history(
     ctx: RunContext[Deps], messages: list[ModelMessage]) -> list[ModelMessage]:
-    """History processor: once history grows past the window, fold the
-    older chunk into a running summary and keep only recent turns verbatim.
-
-    The summary is built incrementally, cached per conversation in-process:
-    each call only summarizes messages that newly aged out of the window
-    since the last call, extending the cached summary, rather than
-    re-summarizing the whole "old" chunk from scratch every turn.
-    """
+    """Past CONTEXT_WINDOW, fold older turns into a cached running summary."""
     if len(messages) <= CONTEXT_WINDOW:
         logger.info(
             "compact_history: skipped (%d messages <= window %d)",
@@ -455,8 +410,7 @@ async def _compact_history(
 
     conversation_id = ctx.deps.conversation_id
     if conversation_id is None:
-        # Sub-run (e.g. the summarizer's own agent.run call) -- there's no
-        # conversation to key a running summary by.
+        # Sub-run (e.g. summarizer's own agent.run) -- no conversation to key a summary by.
         logger.info("compact_history: summarizing %d messages (no conversation_id)", len(old))
         summary = await _summarize_messages(old)
     else:
@@ -493,6 +447,16 @@ agent = Agent(
         "amount), call update_holding to fix the existing entry -- do NOT log a "
         "new one. If they want to remove a purchase, call remove_holding. "
         "When they ask how their portfolio is doing, call get_portfolio. "
+        "When they ask what they've bought, their individual buy prices/lots, "
+        "or how many purchases they've logged for a coin (overall or for one "
+        "coin), call list_holdings instead of write_sql_query -- it reads the "
+        "holdings table directly and can't hallucinate a wrong table/column "
+        "the way a generated query occasionally can. "
+        "Holdings can change mid-conversation (new purchases, corrections, "
+        "removals) -- for any holdings/portfolio question, always call the "
+        "relevant tool again for a fresh answer, even if you or the user "
+        "already discussed this coin earlier in the conversation. Never "
+        "answer from an earlier reply in this chat without re-checking. "
         "When they ask for a chart of their own portfolio, call "
         "create_portfolio_chart. It can make allocation, profit/loss, or "
         "cost-vs-current-value charts from their private holdings. "
@@ -533,12 +497,8 @@ agent = Agent(
     toolsets=[crypto_mcp_tools],
 )
 
-# Each conversation's Repository shares one SQLAlchemy async session, which
-# only supports one flush in flight at a time. If the model calls two
-# holding-writing tools in the same turn (e.g. "I bought BTC and ETH"),
-# pydantic-ai runs them concurrently and they'd race on that session and
-# crash with "Session is already flushing". A per-conversation lock
-# serializes them instead.
+# Serializes concurrent holding-writing tool calls per conversation, since they'd
+# otherwise race on the shared async session and crash with "already flushing".
 _holding_locks: dict[UUID, asyncio.Lock] = {}
 
 
@@ -617,22 +577,14 @@ async def remove_holding(
         return f"Removed your {coin} holding."
     return f"Couldn't find a {coin} holding to remove."
 
-# CoinGecko's free tier rate-limits aggressively (a handful of calls/minute).
-# A short in-memory cache means repeated portfolio/chart requests within the
-# window are served without hitting CoinGecko again at all, and if a request
-# does go out and gets rate-limited or fails, we fall back to the last good
-# response instead of crashing the endpoint.
+# Short in-memory cache so repeated requests don't all hit CoinGecko's rate limit.
 MARKET_CACHE_TTL_SECONDS = 45
 _market_cache: dict[tuple[str, ...], tuple[float, list[dict]]] = {}
 
 
 async def _fetch_market_data(coin_ids: list[str]) -> list[dict]:
-    """Fetch CoinGecko market data (price, 24h change, etc.) for the given
-    coin ids. Never raises -- on rate limits, bad responses, or network
-    errors it logs a warning and returns the last cached result (or an
-    empty list if there's no cache yet), so callers can degrade cleanly
-    instead of crashing.
-    """
+    """Fetch CoinGecko market data for the given coin ids. Never raises -- falls
+    back to the last cached result (or []) on rate limits/errors."""
     cache_key = tuple(sorted(coin_ids))
     cached = _market_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < MARKET_CACHE_TTL_SECONDS:
@@ -669,7 +621,8 @@ async def get_portfolio_report(repo: Repository, conversation_id: UUID) -> dict:
 
     positions: dict[str, dict] = {}
     for h in holdings:
-        p = positions.setdefault(h.coin, {"amount": 0.0, "cost": 0.0})
+        # Normalize case -- older/seeded rows can be mixed-case ('Ethereum' vs 'ethereum').
+        p = positions.setdefault(h.coin.lower(), {"amount": 0.0, "cost": 0.0})
         p["amount"] += float(h.amount)
         p["cost"] += float(h.amount) * float(h.buy_price)
 
@@ -681,10 +634,7 @@ async def get_portfolio_report(repo: Repository, conversation_id: UUID) -> dict:
     report = {}
     total_value = 0.0
     total_cost = 0.0
-    # Portfolio-wide "today's move": back out yesterday's value per coin from
-    # its 24h % change, sum both sides, then diff -- a simple $ change would
-    # instead double-count cost basis, so this only uses coins with known
-    # current value and a known 24h change.
+    # Today's move: back out yesterday's value per coin from its 24h % change, then diff.
     value_today_with_change = 0.0
     value_yesterday_with_change = 0.0
     for coin, p in positions.items():
@@ -692,9 +642,7 @@ async def get_portfolio_report(repo: Repository, conversation_id: UUID) -> dict:
         m = market_by_id.get(coin)
 
         if m is None and prices_unavailable:
-            # CoinGecko is down/rate-limited entirely -- report what we
-            # actually know (cost basis) and mark the rest as unknown
-            # rather than showing a fabricated $0 value / -100% loss.
+            # CoinGecko is down entirely -- report known cost basis, not a fabricated $0/-100%.
             report[coin] = {
                 "amount": round(p["amount"], 8),
                 "avg_buy_price": round(avg_cost, 2),
@@ -773,6 +721,33 @@ async def get_portfolio_report(repo: Repository, conversation_id: UUID) -> dict:
 async def get_portfolio(ctx: RunContext[Deps]) -> dict:
     """Get the current private portfolio with market context and P&L."""
     return await get_portfolio_report(ctx.deps.repo, ctx.deps.conversation_id)
+
+
+@agent.tool
+async def list_holdings(ctx: RunContext[Deps], coin: str | None = None) -> dict:
+    """List the individual purchase lots (amount + buy price each) logged
+    in this conversation, optionally filtered to one coin.
+
+    Prefer this over write_sql_query for straightforward "what have I
+    bought", "show my buy prices for X", "how many lots of X do I have"
+    style questions -- it reads the holdings table directly instead of
+    asking a model to freehand SQL, so it can't hallucinate a wrong table
+    or column the way a generated query occasionally does.
+
+    Args:
+        coin: CoinGecko coin id, name, or symbol to filter to (e.g.
+            'bitcoin', 'Bitcoin', 'BTC'). Omit to list every coin.
+    """
+    coin_id = (await resolve_coin_id(coin))["coin_id"] if coin else None
+    holdings = await ctx.deps.repo.get_holdings(ctx.deps.conversation_id, coin=coin_id)
+    if not holdings:
+        return {"message": f"No holdings recorded for {coin}." if coin else "No holdings recorded yet."}
+    return {
+        "lots": [
+            {"coin": h.coin, "amount": float(h.amount), "buy_price": float(h.buy_price)}
+            for h in holdings
+        ]
+    }
 
 
 @agent.tool
@@ -867,8 +842,26 @@ async def write_sql_query(ctx: RunContext[Deps], task: str) -> str:
 
     try:
         rows = await ctx.deps.repo.execute_raw_sql(sql_query)
-    except Exception as e:
-        return f"Query used:\n{sql_query}\n\nThe query failed to run: {e}"
+    except Exception as first_error:
+        # A failed query leaves the session's transaction aborted -- roll back before retrying.
+        await ctx.deps.repo.rollback()
+
+        # One retry, with the real error + schema pasted into the task text -- grounds
+        # the retry better than trusting the model to re-read the system instructions.
+        retry_task = (
+            f"{task}\n\nYour previous query failed. Query you wrote:\n{sql_query}\n\n"
+            f"Error: {first_error}\n\n"
+            f"These are the ONLY real tables and columns that exist -- do not "
+            f"use any table or column not listed here:\n\n{get_schema_text()}\n\n"
+            "Write a corrected query using only the tables/columns above."
+        )
+        retry_result = await sql_agent.run(retry_task, deps=ctx.deps)
+        sql_query = retry_result.output.strip().strip("`")
+        try:
+            rows = await ctx.deps.repo.execute_raw_sql(sql_query)
+        except Exception as second_error:
+            await ctx.deps.repo.rollback()
+            return f"Query used:\n{sql_query}\n\nThe query failed to run: {second_error}"
 
     if not rows:
         return f"Query used:\n{sql_query}\n\nResult: the query ran successfully but returned no rows."
@@ -888,9 +881,7 @@ async def write_sql_query(ctx: RunContext[Deps], task: str) -> str:
     )
 
 
-# Cap on how much retrieved document text gets injected per turn (roughly
-# 1500 tokens at ~4 chars/token) so RAG context can't crowd out the rest of
-# the conversation window.
+# Cap on retrieved document text injected per turn (~1500 tokens at ~4 chars/token).
 DOCUMENT_CONTEXT_CHAR_BUDGET = 6000
 DOCUMENT_CONTEXT_TOP_K = 5
 
@@ -898,11 +889,7 @@ DOCUMENT_CONTEXT_TOP_K = 5
 async def _build_document_context(
     repo: Repository, user_id: UUID | None, query: str
 ) -> str | None:
-    """Auto-retrieve the top-k most relevant chunks from the user's own
-    uploaded documents for this message, token-budgeted. Never raises --
-    on any embedding/DB failure this degrades to "no context" rather than
-    breaking the chat turn.
-    """
+    """Auto-retrieve top-k relevant chunks from the user's documents. Never raises."""
     if repo is None or user_id is None or not query.strip():
         return None
     with logfire.span(
@@ -937,9 +924,7 @@ async def _build_document_context(
 
 
 def _to_model_messages(history: list[dict]) -> list[ModelMessage]:
-    """Turn our [{'role','content'}] list into Pydantic AI message objects.
-    We skip the last one (that's the new prompt, passed separately).
-    """
+    """Turn [{'role','content'}] into Pydantic AI messages, skipping the last (the new prompt)."""
     messages: list[ModelMessage] = []
     for m in history[:-1]:
         if m["role"] == "user":
@@ -948,9 +933,7 @@ def _to_model_messages(history: list[dict]) -> list[ModelMessage]:
             messages.append(ModelResponse(parts=[TextPart(content=m["content"])]))
     return messages
 
-# Tool calls whose output feeds risk/performance judgments -- if the model
-# used one of these to answer, we append a disclaimer to the reply
-# ourselves rather than trusting the model to remember to add it every time.
+# If the model used one of these to answer, we append the disclaimer ourselves.
 RISK_SIGALING_TOOLS = {"get_portfolio_risk", "get_portfolio"}
 NOT_FINANCIAL_ADVICE_NOTE = (
     "\n\n_Not financial advice: this is an automated summary of your logged "
@@ -994,7 +977,6 @@ async def summarize_title(history: list[dict]) -> str:
         "Summarize this conversation into a short title of at most 6 words. "
         "Reply with the title only.\n\n" + convo
     )
-    #result = await agent.run(prompt, deps=Deps(repo=None, conversation_id=None))
     result = await summarizer_agent.run(prompt, deps=Deps(repo=None, conversation_id=None))
     return result.output.strip()[:80]
 

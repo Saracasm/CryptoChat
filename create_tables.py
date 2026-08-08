@@ -9,13 +9,10 @@ import app.models  # noqa: F401
 
 async def main():
     async with engine.begin() as conn:
-        # Required once per database before the `embedding` Vector column
-        # (document_embeddings) can be created.
+        # Required once per DB before the `embedding` Vector column can be created.
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
-        # HNSW index for fast approximate cosine-similarity search, scoped
-        # per query by document_id -> profile_id join (see
-        # Repository.search_document_chunks).
+        # HNSW index for fast approximate cosine-similarity search.
         await conn.execute(
             text(
                 "CREATE INDEX IF NOT EXISTS document_embeddings_embedding_hnsw_idx "
